@@ -28,8 +28,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "release tag must match vMAJOR.MINOR.PATCH" >&2
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
+            echo "release tag must match vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-N" >&2
             exit 1
           fi
           git fetch --no-tags origin main
@@ -57,6 +57,8 @@ jobs:
           mkdir -p internal/webui/static
           find internal/webui/static -mindepth 1 ! -name placeholder.txt -exec rm -rf {} +
           cp -R web/out/. internal/webui/static/
+          # _next/ assets are served from CDN; strip from embed to keep binary small
+          rm -rf internal/webui/static/_next
 
       - name: Setup Go
         uses: actions/setup-go@v6.4.0
@@ -131,6 +133,9 @@ jobs:
               tar -czf "dist/${PKG}.tar.gz" -C dist "${PKG}"
             fi
           done
+
+          # Package the web static export alongside the binaries
+          (cd web/out && zip -r ../../dist/web-static.zip .)
 
           (cd dist && sha256sum *.tar.gz *.zip > checksums.txt)
           (cd dist && sha256sum --check checksums.txt)
