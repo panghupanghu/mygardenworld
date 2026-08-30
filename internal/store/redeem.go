@@ -1,12 +1,14 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +19,7 @@ import (
 
 const (
 	RedeemValidationPending         = "pending"
+	RedeemAttemptStatusRunning      = "running"
 	RedeemValidationSuccess         = "success"
 	RedeemValidationAlreadyRedeemed = "already_redeemed"
 	RedeemValidationExpired         = "expired"
@@ -26,6 +29,11 @@ const (
 
 	RedeemSourceMyGardenWorld = "mygardenworld"
 	RedeemSourceCustomHTTP    = "custom_http"
+
+	RedeemAttemptFilterAll         = "all"
+	RedeemAttemptFilterRedeemed    = "redeemed"
+	RedeemAttemptFilterUnavailable = "unavailable"
+	RedeemAttemptFilterAttention   = "attention"
 )
 
 type RedeemCode struct {
@@ -57,23 +65,28 @@ type RedeemCodeInput struct {
 }
 
 type RedeemSource struct {
-	ID                  int64
-	Name                string
-	Type                string
-	BaseURL             string
-	Channel             string
-	ParserConfigJSON    string
-	Enabled             bool
-	PushEnabled         bool
-	PollIntervalSeconds int
-	RemoteInstanceID    string
-	Cursor              string
-	LastSyncAt          *time.Time
-	LastError           string
-	AcceptedCount       int64
-	InvalidCount        int64
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	ID                   int64
+	Name                 string
+	Type                 string
+	BaseURL              string
+	Channel              string
+	ParserConfigJSON     string
+	Enabled              bool
+	PushEnabled          bool
+	PollIntervalSeconds  int
+	RemoteInstanceID     string
+	Cursor               string
+	LastSyncAt           *time.Time
+	LastError            string
+	ObservedCount        int64
+	TrustedCount         int64
+	SuccessCount         int64
+	AlreadyRedeemedCount int64
+	ExpiredCount         int64
+	InvalidCount         int64
+	PendingCount         int64
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 type RedeemSourceInput struct {
@@ -98,6 +111,38 @@ type RedeemAttempt struct {
 	Fingerprint  string
 	ExpiresAt    *time.Time
 	AttemptCount int
+}
+
+type RedeemAttemptRecord struct {
+	ID           int64
+	AccountID    int64
+	Channel      string
+	Code         string
+	Status       string
+	Message      string
+	AttemptCount int
+	AttemptedAt  *time.Time
+	ExpiresAt    *time.Time
+	UpdatedAt    time.Time
+}
+
+type RedeemAttemptSummary struct {
+	Total           int64
+	Success         int64
+	AlreadyRedeemed int64
+	Expired         int64
+	Invalid         int64
+	Pending         int64
+	Running         int64
+	Retryable       int64
+	Unknown         int64
+}
+
+type ListRedeemAttemptsOptions struct {
+	AccountID int64
+	BeforeID  int64
+	Limit     int
+	Filter    string
 }
 
 type RedeemOutboxItem struct {
@@ -357,6 +402,83 @@ WHERE c.validation NOT IN ('expired', 'invalid')
 	return err
 }
 
+func (d *DB) ListRedeemAttempts(ctx context.Context, opts ListRedeemAttemptsOptions) ([]RedeemAttemptRecord, RedeemAttemptSummary, error) {
+	var summary RedeemAttemptSummary
+	tx, err := d.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, summary, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*),
+       COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN status = 'already_redeemed' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN status = 'invalid' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN status = 'retryable' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN status = 'unknown' THEN 1 ELSE 0 END), 0)
+FROM redeem_attempts
+WHERE account_id = ?`, opts.AccountID).Scan(
+		&summary.Total, &summary.Success, &summary.AlreadyRedeemed, &summary.Expired,
+		&summary.Invalid, &summary.Pending, &summary.Running, &summary.Retryable, &summary.Unknown,
+	); err != nil {
+		return nil, summary, err
+	}
+
+	query := `
+SELECT a.id, a.account_id, c.channel, c.code, a.status, a.message, a.attempt_count,
+       a.attempted_at, c.expires_at, a.updated_at
+FROM redeem_attempts a
+JOIN redeem_codes c ON c.id = a.redeem_code_id
+WHERE a.account_id = ?`
+	args := []any{opts.AccountID}
+	switch opts.Filter {
+	case RedeemAttemptFilterRedeemed:
+		query += ` AND a.status IN ('success', 'already_redeemed')`
+	case RedeemAttemptFilterUnavailable:
+		query += ` AND a.status IN ('expired', 'invalid')`
+	case RedeemAttemptFilterAttention:
+		query += ` AND a.status IN ('pending', 'running', 'retryable', 'unknown')`
+	}
+	if opts.BeforeID > 0 {
+		query += ` AND a.id < ?`
+		args = append(args, opts.BeforeID)
+	}
+	query += ` ORDER BY a.id DESC LIMIT ?`
+	args = append(args, opts.Limit)
+
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, summary, err
+	}
+	records := make([]RedeemAttemptRecord, 0, opts.Limit)
+	for rows.Next() {
+		var record RedeemAttemptRecord
+		var attemptedAt, expiresAt sql.NullTime
+		if err := rows.Scan(&record.ID, &record.AccountID, &record.Channel, &record.Code,
+			&record.Status, &record.Message, &record.AttemptCount, &attemptedAt, &expiresAt,
+			&record.UpdatedAt); err != nil {
+			return nil, summary, err
+		}
+		record.AttemptedAt = nullTimePtr(attemptedAt)
+		record.ExpiresAt = nullTimePtr(expiresAt)
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, summary, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, summary, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, summary, err
+	}
+	return records, summary, nil
+}
+
 func (d *DB) RecoverRedeemWork(ctx context.Context) error {
 	now := time.Now().UTC()
 	_, err := d.ExecContext(ctx, `
@@ -443,7 +565,6 @@ UPDATE redeem_attempts SET status = ?, message = ?, retry_at = ?, updated_at = ?
 	if err != nil {
 		return err
 	}
-	firstDecision := current.Validation == RedeemValidationPending || current.Validation == RedeemValidationRetryable || current.Validation == RedeemValidationUnknown
 	revision, err := nextRedeemRevision(ctx, tx)
 	if err != nil {
 		return err
@@ -496,21 +617,6 @@ UPDATE redeem_codes SET validation = 'retryable', last_message = ?, revision = ?
 		if _, err := tx.ExecContext(ctx, `
 UPDATE redeem_codes SET validation = 'unknown', last_message = ?, revision = ?, updated_at = ? WHERE id = ?`,
 			message, revision, now, codeID); err != nil {
-			return err
-		}
-	}
-	if firstDecision {
-		switch status {
-		case RedeemValidationSuccess, RedeemValidationAlreadyRedeemed:
-			_, err = tx.ExecContext(ctx, `
-UPDATE redeem_sources SET accepted_count = accepted_count + 1, updated_at = ?
-WHERE id IN (SELECT source_id FROM redeem_code_observations WHERE redeem_code_id = ? AND source_id IS NOT NULL)`, now, codeID)
-		case RedeemValidationInvalid:
-			_, err = tx.ExecContext(ctx, `
-UPDATE redeem_sources SET invalid_count = invalid_count + 1, updated_at = ?
-WHERE id IN (SELECT source_id FROM redeem_code_observations WHERE redeem_code_id = ? AND source_id IS NOT NULL)`, now, codeID)
-		}
-		if err != nil {
 			return err
 		}
 	}
@@ -591,11 +697,11 @@ UPDATE redeem_sources SET name = ?, type = ?, base_url = ?, channel = ?, parser_
 }
 
 func (d *DB) GetRedeemSource(ctx context.Context, id int64) (*RedeemSource, error) {
-	return scanRedeemSource(d.QueryRowContext(ctx, redeemSourceSelect+` WHERE id = ?`, id))
+	return scanRedeemSource(d.QueryRowContext(ctx, redeemSourceSelect+` WHERE s.id = ?`, id))
 }
 
 func (d *DB) ListRedeemSources(ctx context.Context) ([]*RedeemSource, error) {
-	rows, err := d.QueryContext(ctx, redeemSourceSelect+` ORDER BY id ASC`)
+	rows, err := d.QueryContext(ctx, redeemSourceSelect+` ORDER BY s.id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -612,22 +718,48 @@ func (d *DB) ListRedeemSources(ctx context.Context) ([]*RedeemSource, error) {
 }
 
 func (d *DB) DueRedeemSources(ctx context.Context, now time.Time) ([]*RedeemSource, error) {
-	rows, err := d.QueryContext(ctx, redeemSourceSelect+`
- WHERE enabled = 1 AND (last_sync_at IS NULL OR datetime(last_sync_at, '+' || poll_interval_seconds || ' seconds') <= ?)
- ORDER BY COALESCE(last_sync_at, '1970-01-01') ASC`, now.UTC())
+	rows, err := d.QueryContext(ctx, redeemSourceScheduleSelect)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	var out []*RedeemSource
+	var sources []*RedeemSource
 	for rows.Next() {
-		item, err := scanRedeemSource(rows)
+		source, err := scanRedeemSource(rows)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, item)
+		sources = append(sources, source)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	now = now.UTC()
+	due := make([]*RedeemSource, 0, len(sources))
+	for _, source := range sources {
+		if !source.Enabled {
+			continue
+		}
+		if source.LastSyncAt == nil || !source.LastSyncAt.Add(time.Duration(source.PollIntervalSeconds)*time.Second).After(now) {
+			due = append(due, source)
+		}
+	}
+	slices.SortStableFunc(due, func(left, right *RedeemSource) int {
+		if left.LastSyncAt == nil {
+			if right.LastSyncAt == nil {
+				return cmp.Compare(left.ID, right.ID)
+			}
+			return -1
+		}
+		if right.LastSyncAt == nil {
+			return 1
+		}
+		if order := left.LastSyncAt.Compare(*right.LastSyncAt); order != 0 {
+			return order
+		}
+		return cmp.Compare(left.ID, right.ID)
+	})
+	return due, nil
 }
 
 func (d *DB) UpdateRedeemSourceSync(ctx context.Context, id int64, cursor, remoteInstanceID, lastError string) error {
@@ -710,10 +842,37 @@ UPDATE redeem_exchange_outbox SET status = ?, next_attempt_at = ?, last_error = 
 }
 
 const redeemSourceSelect = `
-SELECT id, name, type, base_url, channel, parser_config_json, enabled, push_enabled,
-       poll_interval_seconds, remote_instance_id, cursor, last_sync_at, last_error,
-       accepted_count, invalid_count, created_at, updated_at
-FROM redeem_sources`
+WITH source_stats AS (
+    SELECT o.source_id,
+           COUNT(DISTINCT o.redeem_code_id) AS observed_count,
+           COUNT(DISTINCT CASE WHEN c.validation IN ('success', 'already_redeemed', 'expired') THEN c.id END) AS trusted_count,
+           COUNT(DISTINCT CASE WHEN c.validation = 'success' THEN c.id END) AS success_count,
+           COUNT(DISTINCT CASE WHEN c.validation = 'already_redeemed' THEN c.id END) AS already_redeemed_count,
+           COUNT(DISTINCT CASE WHEN c.validation = 'expired' THEN c.id END) AS expired_count,
+           COUNT(DISTINCT CASE WHEN c.validation = 'invalid' THEN c.id END) AS invalid_count,
+           COUNT(DISTINCT CASE WHEN c.validation IN ('pending', 'retryable', 'unknown') THEN c.id END) AS pending_count
+    FROM redeem_code_observations o
+    JOIN redeem_codes c ON c.id = o.redeem_code_id
+    WHERE o.source_id IS NOT NULL
+    GROUP BY o.source_id
+)
+SELECT s.id, s.name, s.type, s.base_url, s.channel, s.parser_config_json, s.enabled, s.push_enabled,
+       s.poll_interval_seconds, s.remote_instance_id, s.cursor, s.last_sync_at, s.last_error,
+       COALESCE(ss.observed_count, 0), COALESCE(ss.trusted_count, 0),
+       COALESCE(ss.success_count, 0), COALESCE(ss.already_redeemed_count, 0),
+       COALESCE(ss.expired_count, 0), COALESCE(ss.invalid_count, 0), COALESCE(ss.pending_count, 0),
+       s.created_at, s.updated_at
+FROM redeem_sources s
+LEFT JOIN source_stats ss ON ss.source_id = s.id`
+
+const redeemSourceScheduleSelect = `
+SELECT s.id, s.name, s.type, s.base_url, s.channel, s.parser_config_json, s.enabled, s.push_enabled,
+       s.poll_interval_seconds, s.remote_instance_id, s.cursor, s.last_sync_at, s.last_error,
+       0, 0, 0, 0, 0, 0, 0,
+       s.created_at, s.updated_at
+FROM redeem_sources s
+WHERE s.enabled = 1
+ORDER BY s.id ASC`
 
 func scanRedeemSource(scanner interface{ Scan(...any) error }) (*RedeemSource, error) {
 	var item RedeemSource
@@ -721,8 +880,9 @@ func scanRedeemSource(scanner interface{ Scan(...any) error }) (*RedeemSource, e
 	var lastSync sql.NullTime
 	if err := scanner.Scan(&item.ID, &item.Name, &item.Type, &item.BaseURL, &item.Channel,
 		&item.ParserConfigJSON, &enabled, &pushEnabled, &item.PollIntervalSeconds,
-		&item.RemoteInstanceID, &item.Cursor, &lastSync, &item.LastError, &item.AcceptedCount,
-		&item.InvalidCount, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		&item.RemoteInstanceID, &item.Cursor, &lastSync, &item.LastError, &item.ObservedCount,
+		&item.TrustedCount, &item.SuccessCount, &item.AlreadyRedeemedCount, &item.ExpiredCount,
+		&item.InvalidCount, &item.PendingCount, &item.CreatedAt, &item.UpdatedAt); err != nil {
 		return nil, err
 	}
 	item.Enabled = enabled != 0

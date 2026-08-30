@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -151,16 +152,26 @@ func TestRedeemValidationControlsSourceHealthAndPropagation(t *testing.T) {
 	successID := complete("GOOD", RedeemValidationSuccess)
 	invalidID := complete("BAD", RedeemValidationInvalid)
 	_ = complete("OLD", RedeemValidationExpired)
+	expires := time.Now().Add(time.Hour)
+	if _, _, err := db.UpsertRedeemCode(ctx, RedeemCodeInput{
+		Code: "GOOD", Channel: "ios", ExpiresAt: &expires, SourceID: &target.ID,
+		SourceKey: "source:target", OriginInstanceID: "target-instance",
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	sources, err := db.ListRedeemSources(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sources[0].AcceptedCount != 1 || sources[0].InvalidCount != 1 {
-		t.Fatalf("origin health accepted=%d invalid=%d", sources[0].AcceptedCount, sources[0].InvalidCount)
+	if sources[0].ObservedCount != 3 || sources[0].TrustedCount != 2 || sources[0].SuccessCount != 1 ||
+		sources[0].AlreadyRedeemedCount != 0 || sources[0].ExpiredCount != 1 ||
+		sources[0].InvalidCount != 1 || sources[0].PendingCount != 0 {
+		t.Fatalf("origin stats=%+v", sources[0])
 	}
-	if sources[1].AcceptedCount != 0 || sources[1].InvalidCount != 0 {
-		t.Fatalf("target health accepted=%d invalid=%d", sources[1].AcceptedCount, sources[1].InvalidCount)
+	if sources[1].ObservedCount != 1 || sources[1].TrustedCount != 1 || sources[1].SuccessCount != 1 ||
+		sources[1].InvalidCount != 0 || sources[1].PendingCount != 0 {
+		t.Fatalf("target stats=%+v", sources[1])
 	}
 	var successToTarget, successToOrigin, invalidOutbox int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM redeem_exchange_outbox WHERE redeem_code_id = ? AND source_id = ?`, successID, target.ID).Scan(&successToTarget); err != nil {
@@ -174,5 +185,149 @@ func TestRedeemValidationControlsSourceHealthAndPropagation(t *testing.T) {
 	}
 	if successToTarget != 1 || successToOrigin != 0 || invalidOutbox != 0 {
 		t.Fatalf("outbox target=%d origin=%d invalid=%d", successToTarget, successToOrigin, invalidOutbox)
+	}
+}
+
+func TestDueRedeemSourcesUsesTypedLastSyncTime(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "garden.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	source, err := db.UpsertRedeemSource(ctx, RedeemSourceInput{
+		Name: "scheduled", Type: RedeemSourceCustomHTTP,
+		BaseURL: "https://example.test/codes.json", Channel: "ios",
+		ParserConfigJSON: `{"type":"json_array","code_field":"code","permanent":true}`,
+		Enabled:          true, PollIntervalSeconds: 60,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateRedeemSourceSync(ctx, source.ID, "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	source, err = db.GetRedeemSource(ctx, source.ID)
+	if err != nil || source.LastSyncAt == nil {
+		t.Fatalf("source=%+v err=%v", source, err)
+	}
+	before, err := db.DueRedeemSources(ctx, source.LastSyncAt.Add(59*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 0 {
+		t.Fatalf("source became due before interval: %+v", before)
+	}
+	due, err := db.DueRedeemSources(ctx, source.LastSyncAt.Add(60*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 1 || due[0].ID != source.ID {
+		t.Fatalf("due sources=%+v, want source %d", due, source.ID)
+	}
+}
+
+func TestListRedeemAttemptsScopesSummarizesFiltersAndPaginates(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "garden.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.RedeemInstanceID(ctx); err != nil {
+		t.Fatal(err)
+	}
+	user, err := db.CreateUser(ctx, "owner", "owner@example.test", "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, err := db.CreateAccount(ctx, user.ID, "ios", "ios", "owner", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := []string{
+		RedeemValidationSuccess,
+		RedeemValidationAlreadyRedeemed,
+		RedeemValidationExpired,
+		RedeemValidationInvalid,
+		RedeemValidationPending,
+		RedeemAttemptStatusRunning,
+		RedeemValidationRetryable,
+		RedeemValidationUnknown,
+	}
+	expires := time.Now().Add(time.Hour)
+	for index := range statuses {
+		if _, _, err := db.UpsertRedeemCode(ctx, RedeemCodeInput{
+			Code:      "CODE-" + strconv.Itoa(index),
+			Channel:   "ios",
+			ExpiresAt: &expires,
+			SourceKey: "test:" + strconv.Itoa(index),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.EnsureRedeemAttempts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for index, status := range statuses {
+		if _, err := db.ExecContext(ctx, `
+UPDATE redeem_attempts
+SET status = ?, message = ?, attempt_count = ?, attempted_at = CURRENT_TIMESTAMP
+WHERE account_id = ? AND redeem_code_id = (SELECT id FROM redeem_codes WHERE code = ?)`,
+			status, status, index+1, account.ID, "CODE-"+strconv.Itoa(index)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	all, summary, err := db.ListRedeemAttempts(ctx, ListRedeemAttemptsOptions{
+		AccountID: account.ID,
+		Limit:     20,
+		Filter:    RedeemAttemptFilterAll,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != len(statuses) || all[0].Code != "CODE-7" || all[len(all)-1].Code != "CODE-0" {
+		t.Fatalf("all attempts=%+v", all)
+	}
+	if summary.Total != 8 || summary.Success != 1 || summary.AlreadyRedeemed != 1 ||
+		summary.Expired != 1 || summary.Invalid != 1 || summary.Pending != 1 ||
+		summary.Running != 1 || summary.Retryable != 1 || summary.Unknown != 1 {
+		t.Fatalf("summary=%+v", summary)
+	}
+
+	tests := []struct {
+		filter string
+		want   int
+	}{
+		{RedeemAttemptFilterRedeemed, 2},
+		{RedeemAttemptFilterUnavailable, 2},
+		{RedeemAttemptFilterAttention, 4},
+	}
+	for _, test := range tests {
+		records, gotSummary, err := db.ListRedeemAttempts(ctx, ListRedeemAttemptsOptions{
+			AccountID: account.ID,
+			Limit:     20,
+			Filter:    test.filter,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(records) != test.want || gotSummary != summary {
+			t.Fatalf("filter=%s records=%d summary=%+v", test.filter, len(records), gotSummary)
+		}
+	}
+
+	first, _, err := db.ListRedeemAttempts(ctx, ListRedeemAttemptsOptions{AccountID: account.ID, Limit: 3})
+	if err != nil || len(first) != 3 {
+		t.Fatalf("first page=%+v err=%v", first, err)
+	}
+	second, _, err := db.ListRedeemAttempts(ctx, ListRedeemAttemptsOptions{
+		AccountID: account.ID,
+		BeforeID:  first[len(first)-1].ID,
+		Limit:     3,
+	})
+	if err != nil || len(second) != 3 || second[0].ID >= first[len(first)-1].ID {
+		t.Fatalf("second page=%+v err=%v", second, err)
 	}
 }
