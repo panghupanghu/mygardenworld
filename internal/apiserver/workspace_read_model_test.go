@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -78,6 +79,51 @@ func TestBuildPearlHireStatusViewExposesDailyUsageAndSlots(t *testing.T) {
 	}
 	if got.GetSlots()[1].GetPlaceId() != 2 || got.GetSlots()[1].GetActive() || got.GetSlots()[1].GetLaborUid() != 0 {
 		t.Fatalf("empty pearl slot=%+v", got.GetSlots()[1])
+	}
+}
+
+func TestVideoActionReadModelsKeepDomainOwnershipAndState(t *testing.T) {
+	loc := time.FixedZone("Asia/Shanghai", 8*60*60)
+	now := time.Date(2026, 8, 31, 12, 0, 0, 0, loc)
+	st := state.New()
+	st.ApplyVMap(map[string]any{
+		"31": map[string]any{"0": map[string]any{
+			"10": map[string]any{"1": 10, "2": 1, "6": now.UnixMilli()},
+			"14": map[string]any{"1": 14, "2": 1, "6": now.UnixMilli()},
+		}},
+		"112": map[string]any{
+			"1": map[string]any{"1": 1},
+			"5": map[string]any{"1": now.Add(-time.Hour).UnixMilli()},
+			"6": now.UnixMilli(),
+		},
+		"118": map[string]any{"1": 2, "2": now.Add(90 * time.Minute).UnixMilli()},
+		"105": map[string]any{"0": map[string]any{
+			"1": map[string]any{
+				"2": map[string]any{"0": 81, "1": 9, "3": 1, "7": map[string]any{"11": 1200}},
+			},
+			"6": map[string]any{"4": 1, "5": map[string]any{"7": 30}},
+		}},
+		"25": map[string]any{"133": map[string]any{"4": now.UnixMilli(), "5": map[string]any{"1": 1}}},
+	})
+
+	basic := buildBasicVideoActions(st, now)
+	if len(basic) != 3 || basic[0].GetState() != pb.VideoActionState_VIDEO_ACTION_STATE_ACTIVE || basic[0].GetExpiresAtMs() != now.Add(90*time.Minute).UnixMilli() {
+		t.Fatalf("basic video actions=%+v", basic)
+	}
+	if basic[1].GetState() != pb.VideoActionState_VIDEO_ACTION_STATE_COOLDOWN || basic[1].GetUsed() != 1 || len(basic[1].GetRewards()) != 1 || basic[1].GetRewards()[0].GetCount() != 6 {
+		t.Fatalf("giftbag action=%+v", basic[1])
+	}
+	if basic[2].GetState() != pb.VideoActionState_VIDEO_ACTION_STATE_READY || basic[2].GetUsed() != 1 || basic[2].GetLimit() != 2 {
+		t.Fatalf("pearl action=%+v", basic[2])
+	}
+
+	orders := buildResidentVideoOrders(st, now)
+	if len(orders) != 2 || orders[0].GetLabel() != "居民订单 #2" || orders[1].GetLabel() != "绸缎订单" || orders[0].GetRewards()[0].GetItemId() != 11 {
+		t.Fatalf("resident video actions=%+v", orders)
+	}
+	build := buildFmlVideoBuildStatus(st, now)
+	if build.GetState() != pb.VideoActionState_VIDEO_ACTION_STATE_EXHAUSTED || build.GetUsed() != 1 || build.GetLimit() != 1 || len(build.GetRewards()) != 1 || build.GetAvailableAtMs() != state.NextCalendarDayReset(now).UnixMilli() {
+		t.Fatalf("guild video build=%+v", build)
 	}
 }
 
@@ -509,6 +555,25 @@ func TestBuildPendingTasksUsesZooLogPetAndIndexIDs(t *testing.T) {
 	}
 	if _, exists := statuses["7:2096"]; exists {
 		t.Fatalf("pending task used eventId instead of log idx: %+v", statuses)
+	}
+}
+
+func TestBuildPendingTasksAggregatesZooCollectionFailure(t *testing.T) {
+	st := state.New()
+	st.ApplyVMap(map[string]any{"33": map[string]any{"2": map[string]any{
+		"first":  map[string]any{"1": 7, "2": 41, "5": 2096, "7": 1, "13": int64(1500)},
+		"second": map[string]any{"1": 7, "2": 42, "5": 2096, "7": 1, "13": int64(1600)},
+	}}})
+	st.ApplyVMap(map[string]any{"33": map[string]any{"2": []any{"invalid"}}})
+
+	var zooTasks []*pb.PendingTaskView
+	for _, task := range buildPendingTasks(st) {
+		if task.GetCategory() == "宠物事件" {
+			zooTasks = append(zooTasks, task)
+		}
+	}
+	if len(zooTasks) != 1 || zooTasks[0].GetId() != "sync" || zooTasks[0].GetStatus() != pb.PlanStatus_PLAN_STATUS_BLOCKED || !strings.Contains(zooTasks[0].GetTitle(), "日志集合") {
+		t.Fatalf("zoo collection tasks=%+v", zooTasks)
 	}
 }
 

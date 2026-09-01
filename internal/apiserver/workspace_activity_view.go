@@ -162,7 +162,7 @@ func buildPendingTasksAtPolicy(st *state.State, now time.Time, policy *pb.Policy
 	sort.Slice(boxIDs, func(i, j int) bool { return boxIDs[i] < boxIDs[j] })
 	for _, boxID := range boxIDs {
 		order := flowerOrders[boxID]
-		if order == nil || len(order.Requires) == 0 {
+		if order == nil || order.IsVideo != 0 || len(order.Requires) == 0 {
 			continue
 		}
 		reqs := flowerRequirements(order.Requires, inventory)
@@ -443,9 +443,13 @@ func buildPendingTasksAtPolicy(st *state.State, now time.Time, policy *pb.Policy
 		if evt.BlockedReason != "" {
 			title = fmt.Sprintf("%s：%s", title, evt.BlockedReason)
 		}
+		id := fmt.Sprintf("%d:%d", evt.PetID, evt.TableID)
+		if evt.Action == "sync_logs" {
+			id = "sync"
+		}
 		out = append(out, &pb.PendingTaskView{
 			Category: "宠物事件",
-			Id:       fmt.Sprintf("%d:%d", evt.PetID, evt.TableID),
+			Id:       id,
 			Title:    title,
 			Status:   status,
 		})
