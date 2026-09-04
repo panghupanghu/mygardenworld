@@ -16,7 +16,7 @@ func (svc *Services) EnableAutomation(ctx context.Context, req *connect.Request[
 	if err != nil {
 		return nil, mapErr(err)
 	}
-	r, err := svc.Manager.Start(ctx, acc.ID)
+	r, err := svc.Manager.StartWithSource(ctx, acc.ID, runner.StartSourceAutomationEnable)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -45,7 +45,7 @@ func (svc *Services) TakeUnionRaceTask(ctx context.Context, req *connect.Request
 	if err != nil {
 		return nil, mapErr(err)
 	}
-	r, err := svc.Manager.Start(ctx, acc.ID)
+	r, err := svc.Manager.StartWithSource(ctx, acc.ID, runner.StartSourceManualOperation)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -53,6 +53,24 @@ func (svc *Services) TakeUnionRaceTask(ctx context.Context, req *connect.Request
 		return nil, connect.NewError(connect.CodeFailedPrecondition, err)
 	}
 	return connect.NewResponse(&pb.TakeUnionRaceTaskResponse{}), nil
+}
+
+func (svc *Services) DeleteUnionRaceTask(ctx context.Context, req *connect.Request[pb.DeleteUnionRaceTaskRequest]) (*connect.Response[pb.DeleteUnionRaceTaskResponse], error) {
+	if req.Msg.GetTaskMsId() <= 0 {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("竞赛任务标识无效"))
+	}
+	acc, err := svc.resolveAccount(ctx, req.Msg.GetAccountId())
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	r, err := svc.Manager.StartWithSource(ctx, acc.ID, runner.StartSourceManualOperation)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	if err := r.DeleteUnionRaceTask(ctx, req.Msg.GetTaskMsId()); err != nil {
+		return nil, connect.NewError(connect.CodeFailedPrecondition, err)
+	}
+	return connect.NewResponse(&pb.DeleteUnionRaceTaskResponse{}), nil
 }
 
 func policyEvent(enabled bool) runner.Event {
