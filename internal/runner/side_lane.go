@@ -26,6 +26,17 @@ func (r *Runner) selectRunnableOperation(candidates []automation.PlannedOp, now 
 			continue
 		}
 		op := candidate
+		if op.Kind == "fmlRace.delTask" && r.raceDeleteWait(now) > 0 {
+			continue
+		}
+		if op.Kind == "fmlRace.upgradeTask" {
+			r.mu.RLock()
+			attempted := r.raceUpgradeAttempts[[2]int64{op.RaceBatchID, op.TaskMsID}]
+			r.mu.RUnlock()
+			if attempted {
+				continue
+			}
+		}
 		if r.cultivateUpgradeResourceRejectedUnchanged(&op) {
 			continue
 		}

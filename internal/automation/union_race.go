@@ -250,7 +250,7 @@ func unionRaceOperations(s *state.State, policy *pb.UnionRacePolicy, uid int64, 
 		}
 	}
 
-	// autoEnableModules gates take/finish/upgrade. Low-score deletion and
+	// autoEnableModules gates take/finish. Low-score deletion, upgrading and
 	// explicitly enabled give-up are independent policies. When auto-complete is
 	// off, the race module still syncs (enter/getTaskList + TTL refresh) so the
 	// task pool remains visible and may delete eligible low-score rows, but does
@@ -264,7 +264,8 @@ func unionRaceOperations(s *state.State, policy *pb.UnionRacePolicy, uid int64, 
 			op.PreemptFarm = true
 			return []PlannedOp{op}
 		}
-		ops := raceLowScoreDeleteOperations(s, view, policy, goal)
+		ops := raceLowScoreDeleteOperations(s, view, policy, goal, now)
+		ops = append(ops, raceUpgradeOperations(s, view, policy, goal, now)...)
 		if op, ok := raceUsrRankScoreSyncOp(view, goal, now); ok {
 			ops = append(ops, op)
 		}
@@ -328,6 +329,7 @@ func unionRaceOperations(s *state.State, policy *pb.UnionRacePolicy, uid int64, 
 				op.TaskID = best.TaskId
 			}
 			op.FlowerID = best.ParamID
+			op.RaceTaskGuard = newRaceTaskMutationGuard(best, false)
 			op.PreemptFarm = true
 			ops = append(ops, op)
 		}
@@ -350,14 +352,38 @@ func unionRaceOperations(s *state.State, policy *pb.UnionRacePolicy, uid int64, 
 		return []PlannedOp{op}
 	}
 
-	// 3. Optional: upgrade the currently held task. The observed client sends
-	// an empty upgradeTask request, so this RPC cannot target an arbitrary pool
-	// row. Its diamond cost must be known and pass the configured budget; the
-	// global diamond gate still blocks automatic execution by default.
+	ops = append(ops, raceUpgradeOperations(s, view, policy, goal, now)...)
+
+	// 4. Optional: delete low-score tasks. A stale pool is never mutated.
+	if !raceTaskPoolTTLStale(view, now) {
+		ops = append(ops, raceLowScoreDeleteOperations(s, view, policy, goal, now)...)
+	}
+	if len(ops) == 0 {
+		if op, ok := raceUsrRankScoreSyncOp(view, goal, now); ok {
+			return []PlannedOp{op}
+		}
+	}
+	return ops
+}
+
+// Upgrading a held task is explicitly enabled independently of auto-complete.
+// The runner refreshes and revalidates the empty-request RPC's target and cost.
+func raceUpgradeOperations(s *state.State, view state.FmlRaceView, policy *pb.UnionRacePolicy, goal Goal, now time.Time) []PlannedOp {
+	var ops []PlannedOp
+	if raceTaskPoolTTLStale(view, now) || view.TaskPoolStale {
+		return nil
+	}
+	if view.Taken.TargetCnt > 0 && view.Taken.FinishCnt >= view.Taken.TargetCnt {
+		return nil
+	}
 	if policy.GetUpgradeTask() && view.Taken.HasTask {
 		if task, ok := raceTaskByMsID(view.Tasks, view.Taken.TaskMsId); ok && task.IsUpgrade == 0 {
 			op := domainOp(clientproto.RPCFmlRaceUpgradeTask.String(), goal, "union.race.upgrade", "upgrade", "公会竞赛当前任务可升级", 4370, 0, 0, 0)
+			op.PreemptFarm = true
 			op.TaskMsID = task.MsId
+			op.RaceBatchID = view.BatchID
+			op.CooldownKey = fmt.Sprintf("union.race.upgrade:%d:%d", view.BatchID, task.MsId)
+			op.RaceTaskGuard = newRaceTaskMutationGuard(task, false)
 			op.TaskID = task.TaskType
 			if op.TaskID == 0 {
 				op.TaskID = task.TaskId
@@ -365,7 +391,7 @@ func unionRaceOperations(s *state.State, policy *pb.UnionRacePolicy, uid int64, 
 			op.FlowerID = task.ParamID
 			cost, costKnown := state.FmlRaceTaskUpgradeCost(task.TaskId, task.Score)
 			switch {
-			case !costKnown:
+			case !costKnown || cost <= 0:
 				op.Status = PlanStatusAdapterMissing
 				op.Executable = false
 				op.BlockedReasons = []string{"公会竞赛任务升级成本无法从客户端配置确认"}
@@ -373,7 +399,7 @@ func unionRaceOperations(s *state.State, policy *pb.UnionRacePolicy, uid int64, 
 				op.DiamondCost = cost
 				op.Status = PlanStatusBlocked
 				op.Executable = false
-				op.BlockedReasons = []string{"公会竞赛任务升级元宝预算未设置"}
+				op.BlockedReasons = []string{"单次升级元宝上限为 0，禁止消费"}
 			case int64(cost) > policy.GetMaxSpendDiamond():
 				op.DiamondCost = cost
 				op.Status = PlanStatusBlocked
@@ -385,23 +411,41 @@ func unionRaceOperations(s *state.State, policy *pb.UnionRacePolicy, uid int64, 
 			ops = append(ops, op)
 		}
 	}
-
-	// 4. Optional: delete low-score tasks. A stale pool is never mutated; when
-	// a primary take is concurrently due, the take wins and deletion waits for
-	// the resulting fresh task delta / next pool sync.
-	if !raceTaskPoolTTLStale(view, now) {
-		ops = append(ops, raceLowScoreDeleteOperations(s, view, policy, goal)...)
-	}
-
-	// Idle: sync personal score/rank without preempting take/finish/giveUp.
-	// getTaskList also piggybacks a member-rank fetch for the common path.
-	if len(ops) == 0 {
-		if op, ok := raceUsrRankScoreSyncOp(view, goal, now); ok {
-			return []PlannedOp{op}
-		}
-	}
-
 	return ops
+}
+
+// ValidateRaceUpgrade permits exactly the implemented paid operation, never
+// a generic diamond-cost bypass. Called again immediately before sending.
+func ValidateRaceUpgrade(s *state.State, policy *pb.UnionRacePolicy, op *PlannedOp, now time.Time) error {
+	if s == nil || op == nil || op.Kind != clientproto.RPCFmlRaceUpgradeTask.String() || op.RaceTaskGuard == nil {
+		return fmt.Errorf("竞赛升级缺少任务校验信息")
+	}
+	if !policy.GetEnabled() || !policy.GetUpgradeTask() {
+		return fmt.Errorf("自动升级任务未开启")
+	}
+	view := s.FmlRace()
+	build := s.FmlBuild()
+	if !view.ActiveAt(now) || view.BatchID != op.RaceBatchID || !view.TasksObserved || view.TaskPoolStale || raceTaskPoolTTLStale(view, now) ||
+		(build.MembershipObserved && build.MemberFmlID <= 0) {
+		return fmt.Errorf("竞赛当前周期或任务池尚未确认")
+	}
+	if !view.Taken.HasTask || view.Taken.TaskMsId != op.TaskMsID ||
+		(view.Taken.TargetCnt > 0 && view.Taken.FinishCnt >= view.Taken.TargetCnt) ||
+		(view.Taken.ExpireTime > 0 && view.Taken.ExpireTime <= now.UnixMilli()) {
+		return fmt.Errorf("当前已接任务已变化、完成或过期")
+	}
+	task, ok := raceTaskByMsID(view.Tasks, op.TaskMsID)
+	if !ok || s.RoleID() <= 0 || task.UID != s.RoleID() || task.IsUpgrade != 0 || task.TaskId != op.RaceTaskGuard.Planned.TaskID || task.Score != op.RaceTaskGuard.Planned.Score {
+		return fmt.Errorf("当前任务或升级价格已变化，等待重新规划")
+	}
+	cost, known := state.FmlRaceTaskUpgradeCost(task.TaskId, task.Score)
+	if !known || cost <= 0 || cost != op.DiamondCost || policy.GetMaxSpendDiamond() <= 0 || int64(cost) > policy.GetMaxSpendDiamond() {
+		return fmt.Errorf("升级成本不明确或超过单次元宝上限")
+	}
+	if s.SpendableDiamonds() < cost {
+		return fmt.Errorf("升级任务元宝不足")
+	}
+	return nil
 }
 
 func memberPositionSyncDue(build state.FmlBuildView, now time.Time) bool {
@@ -414,7 +458,7 @@ func memberPositionSyncDue(build state.FmlBuildView, now time.Time) bool {
 	return !now.Before(time.UnixMilli(build.MemberPositionSyncAtMs).Add(fmlMemberPositionSyncInterval))
 }
 
-func raceLowScoreDeleteOperations(s *state.State, view state.FmlRaceView, policy *pb.UnionRacePolicy, goal Goal) []PlannedOp {
+func raceLowScoreDeleteOperations(s *state.State, view state.FmlRaceView, policy *pb.UnionRacePolicy, goal Goal, now time.Time) []PlannedOp {
 	if s == nil || policy == nil || !policy.GetDeleteLowScoreTask() || policy.GetDeleteTaskMaxScore() <= 0 || !view.TasksObserved || view.TaskPoolStale {
 		return nil
 	}
@@ -423,11 +467,13 @@ func raceLowScoreDeleteOperations(s *state.State, view state.FmlRaceView, policy
 	for _, task := range view.Tasks {
 		// Score zero is indistinguishable from an omitted field in the observed
 		// client shape. Destructive maintenance must not treat missing data as a
-		// real zero-point task. AppearTime controls when a replacement task can
-		// be taken; it is not an observed deletion precondition. If the server
-		// still rejects deletion during refresh, the runner defers this task by
-		// its task-scoped cooldown without blocking other candidates.
-		if task.MsId <= 0 || task.UID != 0 || task.Score <= 0 || task.Score > maxScore {
+		// real zero-point task. Cooling replacement slots are not actionable in
+		// the mini client; exclude them before score sorting so they cannot
+		// repeatedly win selection only to fail execution-time validation.
+		if task.MsId <= 0 || task.UID != 0 || task.Score <= 0 || task.Score > maxScore || task.FinishCnt > 0 || task.IsUpgrade != 0 {
+			continue
+		}
+		if task.AppearTime > now.UnixMilli() {
 			continue
 		}
 		candidates = append(candidates, task)
@@ -460,6 +506,7 @@ func raceLowScoreDeleteOperations(s *state.State, view state.FmlRaceView, policy
 			op.TaskID = task.TaskId
 		}
 		op.FlowerID = task.ParamID
+		op.RaceTaskGuard = newRaceTaskMutationGuard(task, true)
 		// Global operation ordering uses OperationID as its final stable key.
 		// Preserve score-first deletion after the complete plan is sorted while
 		// keeping retry cooldowns scoped to the mutable task instance.
@@ -475,6 +522,39 @@ func raceLowScoreDeleteOperations(s *state.State, view state.FmlRaceView, policy
 		ops = append(ops, op)
 	}
 	return ops
+}
+
+// RaceAutoDeleteStatus explains the same task/permission gates as the planner.
+// It does not claim an RPC has executed merely because a candidate is eligible.
+func RaceAutoDeleteStatus(s *state.State, policy *pb.UnionRacePolicy, now time.Time) string {
+	if !policy.GetEnabled() {
+		return "任务池同步已关闭"
+	}
+	if !policy.GetDeleteLowScoreTask() {
+		return "自动删除未开启"
+	}
+	if policy.GetDeleteTaskMaxScore() <= 0 {
+		return "删除分数上限为 0，不删除任务"
+	}
+	view := s.FmlRace()
+	if !view.Observed || !view.ActiveAt(now) {
+		return "当前不在竞赛期间"
+	}
+	build := s.FmlBuild()
+	if !build.MemberPositionObserved {
+		return "等待同步公会职位"
+	}
+	if !state.FmlPositionAllowsRaceDelete(build.MemberPosition) {
+		return "当前职位无删除权限，仅会长／副会长可用"
+	}
+	if !view.TasksObserved || view.TaskPoolStale || raceTaskPoolTTLStale(view, now) {
+		return "等待刷新任务池"
+	}
+	ops := raceLowScoreDeleteOperations(s, view, policy, Goal{}, now)
+	if len(ops) > 0 {
+		return fmt.Sprintf("%d 个任务符合删除条件，等待调度", len(ops))
+	}
+	return fmt.Sprintf("暂无可删除的 ≤%d 分任务（已占用、升级、有进度及冷却中任务会跳过）", policy.GetDeleteTaskMaxScore())
 }
 
 const raceEnterProbeInterval = 10 * time.Minute
@@ -811,36 +891,9 @@ func RaceTakeSkipReason(s *state.State, t state.FmlRaceTaskView, policy *pb.Unio
 // switch controls visibility/availability, while the explicit click supplies
 // the execution intent.
 func ManualRaceTakeOperation(s *state.State, policy *pb.Policy, taskMsID int64, now time.Time) (PlannedOp, error) {
-	if s == nil || policy == nil {
-		return PlannedOp{}, fmt.Errorf("公会竞赛状态不可用")
-	}
-	if taskMsID <= 0 {
-		return PlannedOp{}, fmt.Errorf("竞赛任务标识无效")
-	}
-	race := policy.GetUnion().GetRace()
-	if race == nil || !race.GetEnabled() {
-		return PlannedOp{}, fmt.Errorf("请先开启公会竞赛")
-	}
-	view := s.FmlRace()
-	view.BatchActive = view.ActiveAt(now)
-	if !view.Observed || !view.BatchActive {
-		return PlannedOp{}, fmt.Errorf("当前不在有效的公会竞赛批次中")
-	}
-	if !view.TasksObserved || view.TaskPoolStale {
-		return PlannedOp{}, fmt.Errorf("竞赛任务池尚未同步")
-	}
-	if view.Taken.HasTask {
-		return PlannedOp{}, fmt.Errorf("已有竞赛任务，请先完成或放弃当前任务")
-	}
-	if view.TakeQuotaExhausted || raceFreeTaskQuotaDone(s, view, race) {
-		return PlannedOp{}, fmt.Errorf("竞赛任务接取次数已用完")
-	}
-	task, ok := raceTaskByMsID(view.Tasks, taskMsID)
-	if !ok {
-		return PlannedOp{}, fmt.Errorf("任务已不在当前任务池，请等待列表刷新")
-	}
-	if reason := RaceTakeSkipReason(s, task, race, s.RoleID(), now, raceModuleGatesFromPolicy(policy)); reason != "" {
-		return PlannedOp{}, fmt.Errorf("当前不可接取：%s", reason)
+	task, err := raceTakeTaskForOperation(s, policy, taskMsID, now)
+	if err != nil {
+		return PlannedOp{}, err
 	}
 	goal := Goal{ID: "union.race", Category: CategoryRace, Domain: "union.race", Label: "公会竞赛", Priority: 43}
 	op := domainOp(clientproto.RPCFmlRaceTakeTask.String(), goal, "union.race.take", "take", "手动接取公会竞赛任务", 4380, 0, 0, 0)
@@ -850,8 +903,44 @@ func ManualRaceTakeOperation(s *state.State, policy *pb.Policy, taskMsID int64, 
 		op.TaskID = task.TaskId
 	}
 	op.FlowerID = task.ParamID
+	op.RaceTaskGuard = newRaceTaskMutationGuard(task, false)
 	op.PreemptFarm = true
 	return op, nil
+}
+
+func raceTakeTaskForOperation(s *state.State, policy *pb.Policy, taskMsID int64, now time.Time) (state.FmlRaceTaskView, error) {
+	if s == nil || policy == nil {
+		return state.FmlRaceTaskView{}, fmt.Errorf("公会竞赛状态不可用")
+	}
+	if taskMsID <= 0 {
+		return state.FmlRaceTaskView{}, fmt.Errorf("竞赛任务标识无效")
+	}
+	race := policy.GetUnion().GetRace()
+	if race == nil || !race.GetEnabled() {
+		return state.FmlRaceTaskView{}, fmt.Errorf("请先开启公会竞赛")
+	}
+	view := s.FmlRace()
+	view.BatchActive = view.ActiveAt(now)
+	if !view.Observed || !view.BatchActive {
+		return state.FmlRaceTaskView{}, fmt.Errorf("当前不在有效的公会竞赛批次中")
+	}
+	if !view.TasksObserved || view.TaskPoolStale {
+		return state.FmlRaceTaskView{}, fmt.Errorf("竞赛任务池尚未同步")
+	}
+	if view.Taken.HasTask {
+		return state.FmlRaceTaskView{}, fmt.Errorf("已有竞赛任务，请先完成或放弃当前任务")
+	}
+	if view.TakeQuotaExhausted || raceFreeTaskQuotaDone(s, view, race) {
+		return state.FmlRaceTaskView{}, fmt.Errorf("竞赛任务接取次数已用完")
+	}
+	task, ok := raceTaskByMsID(view.Tasks, taskMsID)
+	if !ok {
+		return state.FmlRaceTaskView{}, fmt.Errorf("任务已不在当前任务池，请等待列表刷新")
+	}
+	if reason := RaceTakeSkipReason(s, task, race, s.RoleID(), now, raceModuleGatesFromPolicy(policy)); reason != "" {
+		return state.FmlRaceTaskView{}, fmt.Errorf("当前不可接取：%s", reason)
+	}
+	return task, nil
 }
 
 // ManualRaceDeleteOperation validates an explicit task-pool deletion without
@@ -891,8 +980,102 @@ func ManualRaceDeleteOperation(s *state.State, policy *pb.Policy, taskMsID int64
 		op.TaskID = task.TaskId
 	}
 	op.FlowerID = task.ParamID
+	op.RaceTaskGuard = newRaceTaskMutationGuard(task, false)
 	op.CooldownKey = fmt.Sprintf("union.race.delete:%d", task.MsId)
 	return op, nil
+}
+
+func newRaceTaskMutationGuard(task state.FmlRaceTaskView, automaticDelete bool) *RaceTaskMutationGuard {
+	return &RaceTaskMutationGuard{
+		AutomaticDelete: automaticDelete,
+		Planned:         raceTaskMutationFacts(task),
+	}
+}
+
+func raceTaskMutationFacts(task state.FmlRaceTaskView) RaceTaskMutationFacts {
+	return RaceTaskMutationFacts{
+		MsID:       task.MsId,
+		TaskID:     task.TaskId,
+		TaskType:   task.TaskType,
+		Score:      task.Score,
+		IsUpgrade:  task.IsUpgrade,
+		UpgradeUID: task.UpgradeUid,
+		UID:        task.UID,
+		ParamID:    task.ParamID,
+		FinishCnt:  task.FinishCnt,
+	}
+}
+
+// ValidateRaceTaskMutation rechecks a planned race-pool mutation against the
+// latest full task-list snapshot. It also records the current task facts on the
+// operation so deferred-operation logs explain which field changed.
+func ValidateRaceTaskMutation(s *state.State, policy *pb.Policy, op *PlannedOp, now time.Time) error {
+	if op == nil || op.RaceTaskGuard == nil {
+		return fmt.Errorf("竞赛任务缺少执行前校验信息")
+	}
+	if s != nil {
+		if current, ok := raceTaskByMsID(s.FmlRace().Tasks, op.TaskMsID); ok {
+			op.RaceTaskGuard.Current = raceTaskMutationFacts(current)
+			if op.RaceTaskGuard.Current != op.RaceTaskGuard.Planned {
+				return fmt.Errorf("竞赛任务在规划后已变化（原分数 %d，当前 %d；原升级状态 %d，当前 %d），等待重新规划",
+					op.RaceTaskGuard.Planned.Score, op.RaceTaskGuard.Current.Score,
+					op.RaceTaskGuard.Planned.IsUpgrade, op.RaceTaskGuard.Current.IsUpgrade)
+			}
+		}
+	}
+	var (
+		task state.FmlRaceTaskView
+		err  error
+	)
+	switch op.Kind {
+	case clientproto.RPCFmlRaceUpgradeTask.String():
+		return ValidateRaceUpgrade(s, policy.GetUnion().GetRace(), op, now)
+	case clientproto.RPCFmlRaceTakeTask.String():
+		task, err = raceTakeTaskForOperation(s, policy, op.TaskMsID, now)
+	case clientproto.RPCFmlRaceDelTask.String():
+		task, err = raceDeleteTaskForOperation(s, policy, op.TaskMsID, now, op.RaceTaskGuard.AutomaticDelete)
+	default:
+		return fmt.Errorf("不支持的竞赛任务校验操作 %s", op.Kind)
+	}
+	if err != nil {
+		return err
+	}
+	op.RaceTaskGuard.Current = raceTaskMutationFacts(task)
+	return nil
+}
+
+func raceDeleteTaskForOperation(s *state.State, policy *pb.Policy, taskMsID int64, now time.Time, automatic bool) (state.FmlRaceTaskView, error) {
+	if s == nil || policy == nil || taskMsID <= 0 {
+		return state.FmlRaceTaskView{}, fmt.Errorf("公会竞赛状态不可用")
+	}
+	race := policy.GetUnion().GetRace()
+	if race == nil || !race.GetEnabled() {
+		return state.FmlRaceTaskView{}, fmt.Errorf("请先开启公会竞赛")
+	}
+	view := s.FmlRace()
+	if !view.Observed || !view.ActiveAt(now) || !view.TasksObserved || view.TaskPoolStale {
+		return state.FmlRaceTaskView{}, fmt.Errorf("竞赛任务池尚未同步或批次无效")
+	}
+	task, ok := raceTaskByMsID(view.Tasks, taskMsID)
+	if !ok {
+		return state.FmlRaceTaskView{}, fmt.Errorf("任务已不在当前任务池，请等待列表刷新")
+	}
+	if reason := RaceDeleteSkipReason(s, task, now); reason != "" {
+		return state.FmlRaceTaskView{}, fmt.Errorf("当前不可删除：%s", reason)
+	}
+	if automatic {
+		switch {
+		case !race.GetDeleteLowScoreTask() || race.GetDeleteTaskMaxScore() <= 0:
+			return state.FmlRaceTaskView{}, fmt.Errorf("自动删除低分任务已关闭")
+		case task.Score <= 0 || task.Score > race.GetDeleteTaskMaxScore():
+			return state.FmlRaceTaskView{}, fmt.Errorf("当前分数 %d 已超出自动删除范围", task.Score)
+		case task.FinishCnt > 0:
+			return state.FmlRaceTaskView{}, fmt.Errorf("已有进度的任务不会自动删除")
+		case task.IsUpgrade != 0:
+			return state.FmlRaceTaskView{}, fmt.Errorf("已升级任务不会自动删除")
+		}
+	}
+	return task, nil
 }
 
 // RaceDeleteSkipReason describes the state-derived gate for a manual delete.

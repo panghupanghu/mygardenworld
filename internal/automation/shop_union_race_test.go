@@ -934,6 +934,48 @@ func TestUnionRaceDeleteSkipsOccupiedTask(t *testing.T) {
 	}
 }
 
+func TestUnionRaceDeleteSkipsUpgradedAndProgressedTasks(t *testing.T) {
+	s := state.New()
+	applyRaceState(s, [][5]int32{
+		{1, 3036, 5, 1, 88},
+		{2, 3036, 6, 0, 0},
+	})
+	// A sparse progress update makes task 2 unsafe for unattended deletion.
+	s.ApplyV(json.RawMessage(`{"25":{"114":[{"0":2,"4":3036,"6":[23001],"7":10,"8":1,"10":6,"14":0,"15":0}]}}`))
+	applyRaceDeletePosition(s, 1)
+	policy := testRacePolicy()
+	policy.DeleteLowScoreTask = true
+	policy.DeleteTaskMaxScore = 10
+
+	for _, op := range unionRaceOperations(s, policy, s.RoleID(), time.Now(), raceGatesOn()) {
+		if op.Kind == clientproto.RPCFmlRaceDelTask.String() {
+			t.Fatalf("must not automatically delete upgraded or progressed tasks: %+v", op)
+		}
+	}
+}
+
+func TestValidateRaceTaskMutationRejectsChangedScore(t *testing.T) {
+	now := time.Now()
+	s := state.New()
+	applyRaceState(s, [][5]int32{{1, 3036, 28, 0, 0}})
+	policy := testEnabledRaceFullPolicy()
+	policy.Union.Race.MinTaskScore = 27
+	op, err := ManualRaceTakeOperation(s, policy, 1, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.ApplyVFullFmlRaceTaskPool(json.RawMessage(raceStateJSON([][5]int32{{1, 3036, 21, 0, 0}})))
+	s.NoteFmlRaceTaskPoolSync(now)
+
+	err = ValidateRaceTaskMutation(s, policy, &op, now)
+	if err == nil || !strings.Contains(err.Error(), "原分数 28，当前 21") {
+		t.Fatalf("changed score preflight error=%v", err)
+	}
+	if op.RaceTaskGuard.Current.Score != 21 {
+		t.Fatalf("current task evidence=%+v, want score 21", op.RaceTaskGuard.Current)
+	}
+}
+
 func TestUnionRaceDeleteRunsWhenAutoModulesOff(t *testing.T) {
 	s := state.New()
 	applyRaceState(s, [][5]int32{{1, 3036, 25, 0, 0}})
@@ -1085,30 +1127,47 @@ func TestUnionRaceDeleteOrdersEligibleTasksDeterministically(t *testing.T) {
 	}
 }
 
-func TestUnionRaceDeleteDoesNotTreatTakeAppearTimeAsDeleteGate(t *testing.T) {
-	now := time.Now()
-	s := state.New()
-	applyRaceState(s, [][5]int32{{1, 3036, 5, 0, 0}, {2, 3036, 10, 0, 0}})
-	applyRaceDeletePosition(s, 1)
-	s.ApplyV(json.RawMessage(fmt.Sprintf(
-		`{"25":{"114":[{"0":1,"4":3036,"5":%d,"10":5,"14":0,"15":0},{"0":2,"4":3036,"5":%d,"10":10,"14":0,"15":0}]}}`,
-		now.Add(90*time.Second).UnixMilli(), now.Add(-time.Second).UnixMilli(),
-	)))
-	policy := &pb.UnionRacePolicy{
-		Enabled:            true,
-		DeleteLowScoreTask: true,
-		DeleteTaskMaxScore: 10,
-	}
-
-	ops := unionRaceOperations(s, policy, s.RoleID(), now, raceGatesOn())
-	var deletes []PlannedOp
-	for _, op := range ops {
-		if op.Kind == clientproto.RPCFmlRaceDelTask.String() {
-			deletes = append(deletes, op)
+func TestUnionRaceDeleteSkipsCoolingSlots(t *testing.T) {
+	for _, autoComplete := range []bool{false, true} {
+		for _, tt := range []struct {
+			name      string
+			remaining time.Duration
+			want      []int64
+		}{
+			{"cooling lower score yields", 90 * time.Second, []int64{2}},
+			{"one millisecond before ready", time.Millisecond, []int64{2}},
+			{"ready at exact boundary", 0, []int64{1, 2}},
+			{"ready after boundary", -time.Millisecond, []int64{1, 2}},
+		} {
+			t.Run(fmt.Sprintf("auto=%t/%s", autoComplete, tt.name), func(t *testing.T) {
+				now := time.Now()
+				s := state.New()
+				applyRaceState(s, [][5]int32{{1, 3036, 5, 0, 0}, {2, 3036, 10, 0, 0}})
+				applyRaceDeletePosition(s, 1)
+				s.ApplyV(json.RawMessage(fmt.Sprintf(
+					`{"25":{"114":[{"0":1,"4":3036,"5":%d,"10":5,"14":0,"15":0},{"0":2,"4":3036,"5":%d,"10":10,"14":0,"15":0}]}}`,
+					now.Add(tt.remaining).UnixMilli(), now.Add(-time.Second).UnixMilli(),
+				)))
+				policy := &pb.UnionRacePolicy{
+					Enabled: true, AutoEnableModules: autoComplete, MinTaskScore: 29,
+					DeleteLowScoreTask: true, DeleteTaskMaxScore: 10,
+				}
+				var ids []int64
+				for _, op := range unionRaceOperations(s, policy, s.RoleID(), now, raceGatesOn()) {
+					if op.Kind == clientproto.RPCFmlRaceDelTask.String() {
+						ids = append(ids, op.TaskMsID)
+						fullPolicy := testEnabledRaceFullPolicy()
+						fullPolicy.Union.Race = policy
+						if err := ValidateRaceTaskMutation(s, fullPolicy, &op, now); err != nil {
+							t.Fatalf("planner/preflight disagreement: %v", err)
+						}
+					}
+				}
+				if fmt.Sprint(ids) != fmt.Sprint(tt.want) {
+					t.Fatalf("deletes=%v, want %v", ids, tt.want)
+				}
+			})
 		}
-	}
-	if len(deletes) != 2 || deletes[0].TaskMsID != 1 || deletes[1].TaskMsID != 2 {
-		t.Fatalf("delete ops=%+v, want both low-score tasks regardless of take appearTime", deletes)
 	}
 }
 

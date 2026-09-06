@@ -2653,10 +2653,13 @@ type UnionRacePolicy struct {
 	OnlyUpgradeTask          bool            `protobuf:"varint,5,opt,name=only_upgrade_task,json=onlyUpgradeTask,proto3" json:"only_upgrade_task,omitempty"`
 	ExcludeOthersUpgradeTask bool            `protobuf:"varint,6,opt,name=exclude_others_upgrade_task,json=excludeOthersUpgradeTask,proto3" json:"exclude_others_upgrade_task,omitempty"`
 	TaskTypePriority         map[int32]int32 `protobuf:"bytes,7,rep,name=task_type_priority,json=taskTypePriority,proto3" json:"task_type_priority,omitempty" protobuf_key:"varint,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
-	UpgradeTask              bool            `protobuf:"varint,8,opt,name=upgrade_task,json=upgradeTask,proto3" json:"upgrade_task,omitempty"`
-	DeleteLowScoreTask       bool            `protobuf:"varint,9,opt,name=delete_low_score_task,json=deleteLowScoreTask,proto3" json:"delete_low_score_task,omitempty"`
-	DeleteTaskMaxScore       int32           `protobuf:"varint,10,opt,name=delete_task_max_score,json=deleteTaskMaxScore,proto3" json:"delete_task_max_score,omitempty"`
-	MaxSpendDiamond          int64           `protobuf:"varint,11,opt,name=max_spend_diamond,json=maxSpendDiamond,proto3" json:"max_spend_diamond,omitempty"`
+	// Independently upgrades the current unfinished task, subject to a known
+	// cost and max_spend_diamond. Does not require auto_enable_modules.
+	UpgradeTask        bool  `protobuf:"varint,8,opt,name=upgrade_task,json=upgradeTask,proto3" json:"upgrade_task,omitempty"`
+	DeleteLowScoreTask bool  `protobuf:"varint,9,opt,name=delete_low_score_task,json=deleteLowScoreTask,proto3" json:"delete_low_score_task,omitempty"`
+	DeleteTaskMaxScore int32 `protobuf:"varint,10,opt,name=delete_task_max_score,json=deleteTaskMaxScore,proto3" json:"delete_task_max_score,omitempty"`
+	// Per-task upgrade cost ceiling. Zero prohibits spending; never unlimited.
+	MaxSpendDiamond int64 `protobuf:"varint,11,opt,name=max_spend_diamond,json=maxSpendDiamond,proto3" json:"max_spend_diamond,omitempty"`
 	// When true with auto_enable_modules, stop planning takeTask once this
 	// batch's free task quota is used up (finished_task_num >= total_task_num).
 	// Sync / finish / giveUp of an already-held task still run. Default on in
@@ -2673,8 +2676,12 @@ type UnionRacePolicy struct {
 	// taken outside gardend, so it is an explicit opt-in independent of
 	// auto_enable_modules. Default off.
 	AutoGiveUpTask bool `protobuf:"varint,15,opt,name=auto_give_up_task,json=autoGiveUpTask,proto3" json:"auto_give_up_task,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Account-wide minimum spacing between delete attempts, including manual
+	// deletion and its preflight refresh. Zero uses 120 seconds; clamped to
+	// 30..3600 seconds. This is a conservative local guard, not a server limit.
+	DeleteIntervalSeconds int32 `protobuf:"varint,16,opt,name=delete_interval_seconds,json=deleteIntervalSeconds,proto3" json:"delete_interval_seconds,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *UnionRacePolicy) Reset() {
@@ -2810,6 +2817,13 @@ func (x *UnionRacePolicy) GetAutoGiveUpTask() bool {
 		return x.AutoGiveUpTask
 	}
 	return false
+}
+
+func (x *UnionRacePolicy) GetDeleteIntervalSeconds() int32 {
+	if x != nil {
+		return x.DeleteIntervalSeconds
+	}
+	return 0
 }
 
 type UnionLandPolicy struct {
@@ -3337,7 +3351,7 @@ const file_mygardenworld_v1_policy_proto_rawDesc = "" +
 	"\ftake_enabled\x18\x05 \x01(\bR\vtakeEnabled\x12<\n" +
 	"\ttake_mode\x18\x06 \x01(\x0e2\x1f.mygardenworld.v1.SelectionModeR\btakeMode\x12%\n" +
 	"\x0etake_qualities\x18\a \x03(\x05R\rtakeQualities\x12&\n" +
-	"\x0ftake_flower_ids\x18\b \x03(\x05R\rtakeFlowerIds\"\xf9\x06\n" +
+	"\x0ftake_flower_ids\x18\b \x03(\x05R\rtakeFlowerIds\"\xb1\a\n" +
 	"\x0fUnionRacePolicy\x12\x18\n" +
 	"\aenabled\x18\x01 \x01(\bR\aenabled\x12.\n" +
 	"\x13auto_enable_modules\x18\x02 \x01(\bR\x11autoEnableModules\x12:\n" +
@@ -3354,7 +3368,8 @@ const file_mygardenworld_v1_policy_proto_rawDesc = "" +
 	"\x17auto_stop_on_quota_done\x18\f \x01(\bR\x13autoStopOnQuotaDone\x127\n" +
 	"\x18show_personal_score_rank\x18\r \x01(\bR\x15showPersonalScoreRank\x129\n" +
 	"\x16avoid_progressed_tasks\x18\x0e \x01(\bH\x00R\x14avoidProgressedTasks\x88\x01\x01\x12)\n" +
-	"\x11auto_give_up_task\x18\x0f \x01(\bR\x0eautoGiveUpTask\x1aC\n" +
+	"\x11auto_give_up_task\x18\x0f \x01(\bR\x0eautoGiveUpTask\x126\n" +
+	"\x17delete_interval_seconds\x18\x10 \x01(\x05R\x15deleteIntervalSeconds\x1aC\n" +
 	"\x15TaskTypePriorityEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\x05R\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\x05R\x05value:\x028\x01B\x19\n" +

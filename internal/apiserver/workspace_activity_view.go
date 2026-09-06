@@ -8,6 +8,7 @@ import (
 
 	pb "github.com/SilkageNet/mygardenworld/gen/mygardenworld/v1"
 	"github.com/SilkageNet/mygardenworld/internal/automation"
+	"github.com/SilkageNet/mygardenworld/internal/runner"
 	"github.com/SilkageNet/mygardenworld/internal/state"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -31,12 +32,13 @@ var fmlRaceTaskLabels = map[int32]string{
 
 func fmlRaceProto(view state.FmlRaceView, s *state.State, racePolicy *pb.UnionRacePolicy, uid int64, now time.Time, gates automation.RaceModuleGates) *pb.FmlRaceView {
 	out := &pb.FmlRaceView{
-		Observed:        view.Observed,
-		BatchActive:     view.ActiveAt(now),
-		BatchStartMs:    view.BatchStartMs,
-		BatchEndMs:      view.BatchEndMs,
-		BatchStatus:     view.BatchStatus,
-		TasksSyncedAtMs: view.TasksSyncedAtMs,
+		AutoDeleteStatus: automation.RaceAutoDeleteStatus(s, racePolicy, now),
+		Observed:         view.Observed,
+		BatchActive:      view.ActiveAt(now),
+		BatchStartMs:     view.BatchStartMs,
+		BatchEndMs:       view.BatchEndMs,
+		BatchStatus:      view.BatchStatus,
+		TasksSyncedAtMs:  view.TasksSyncedAtMs,
 	}
 	if view.TaskQuotaObserved {
 		out.TaskQuotaObserved = true
@@ -122,6 +124,37 @@ func activityItemsProto(items []state.ItemCount) []*pb.ActivityItem {
 		out = append(out, activityItemProto(item))
 	}
 	return out
+}
+
+// Project runner-owned safety into existing race status/button fields; the
+// read model does not decide timing or perform game requests.
+func applyRaceRequestSafety(view *pb.FmlRaceView, policy *pb.UnionRacePolicy, diag runner.Diagnostics) {
+	if view == nil {
+		return
+	}
+	cooldowns := cooldownsByOperation(diag)
+	cd, paused := cooldowns["account.request"]
+	if !paused {
+		var ok bool
+		cd, ok = cooldowns["union.race.delete.interval"]
+		if !ok {
+			return
+		}
+	}
+	reason := cd.Reason
+	if !paused {
+		reason = fmt.Sprintf("%s · %s 后可重试", reason, cd.Until.Local().Format("15:04:05"))
+	}
+	if policy.GetDeleteLowScoreTask() {
+		view.AutoDeleteStatus = reason
+	}
+	for _, task := range view.Tasks {
+		task.DeleteAllowed = false
+		task.DeleteBlockedReason = reason
+		if paused {
+			task.TakeSkipReason = cd.Reason
+		}
+	}
 }
 
 func activityItemProto(item state.ItemCount) *pb.ActivityItem {

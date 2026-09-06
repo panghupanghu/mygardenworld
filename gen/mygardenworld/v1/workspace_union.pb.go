@@ -175,14 +175,16 @@ func (x *UnionView) GetVideoBuild() *VideoActionStatusView {
 }
 
 type FmlRaceView struct {
-	state        protoimpl.MessageState `protogen:"open.v1"`
-	Observed     bool                   `protobuf:"varint,1,opt,name=observed,proto3" json:"observed,omitempty"`
-	BatchActive  bool                   `protobuf:"varint,2,opt,name=batch_active,json=batchActive,proto3" json:"batch_active,omitempty"`
-	Taken        *FmlRaceTaken          `protobuf:"bytes,3,opt,name=taken,proto3" json:"taken,omitempty"`
-	Tasks        []*FmlRaceTask         `protobuf:"bytes,4,rep,name=tasks,proto3" json:"tasks,omitempty"`
-	BatchStartMs int64                  `protobuf:"varint,5,opt,name=batch_start_ms,json=batchStartMs,proto3" json:"batch_start_ms,omitempty"`
-	BatchEndMs   int64                  `protobuf:"varint,6,opt,name=batch_end_ms,json=batchEndMs,proto3" json:"batch_end_ms,omitempty"`
-	BatchStatus  int32                  `protobuf:"varint,7,opt,name=batch_status,json=batchStatus,proto3" json:"batch_status,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Planner-derived explanation of automatic deletion gates.
+	AutoDeleteStatus string         `protobuf:"bytes,17,opt,name=auto_delete_status,json=autoDeleteStatus,proto3" json:"auto_delete_status,omitempty"`
+	Observed         bool           `protobuf:"varint,1,opt,name=observed,proto3" json:"observed,omitempty"`
+	BatchActive      bool           `protobuf:"varint,2,opt,name=batch_active,json=batchActive,proto3" json:"batch_active,omitempty"`
+	Taken            *FmlRaceTaken  `protobuf:"bytes,3,opt,name=taken,proto3" json:"taken,omitempty"`
+	Tasks            []*FmlRaceTask `protobuf:"bytes,4,rep,name=tasks,proto3" json:"tasks,omitempty"`
+	BatchStartMs     int64          `protobuf:"varint,5,opt,name=batch_start_ms,json=batchStartMs,proto3" json:"batch_start_ms,omitempty"`
+	BatchEndMs       int64          `protobuf:"varint,6,opt,name=batch_end_ms,json=batchEndMs,proto3" json:"batch_end_ms,omitempty"`
+	BatchStatus      int32          `protobuf:"varint,7,opt,name=batch_status,json=batchStatus,proto3" json:"batch_status,omitempty"`
 	// Local ms when task pool (NS25 field 114) was last applied.
 	TasksSyncedAtMs int64 `protobuf:"varint,8,opt,name=tasks_synced_at_ms,json=tasksSyncedAtMs,proto3" json:"tasks_synced_at_ms,omitempty"`
 	// True after NS25 field 110 (usr rcd) has been observed for task quota.
@@ -233,6 +235,13 @@ func (x *FmlRaceView) ProtoReflect() protoreflect.Message {
 // Deprecated: Use FmlRaceView.ProtoReflect.Descriptor instead.
 func (*FmlRaceView) Descriptor() ([]byte, []int) {
 	return file_mygardenworld_v1_workspace_union_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *FmlRaceView) GetAutoDeleteStatus() string {
+	if x != nil {
+		return x.AutoDeleteStatus
+	}
+	return ""
 }
 
 func (x *FmlRaceView) GetObserved() bool {
@@ -629,11 +638,12 @@ type FmlLandView struct {
 	Level       int32 `protobuf:"varint,2,opt,name=level,proto3" json:"level,omitempty"`
 	FlowerId    int32 `protobuf:"varint,3,opt,name=flower_id,json=flowerId,proto3" json:"flower_id,omitempty"`
 	StartTimeMs int64 `protobuf:"varint,4,opt,name=start_time_ms,json=startTimeMs,proto3" json:"start_time_ms,omitempty"`
-	// Protocol matureFlwCnt; often stale until the client UI recalculates.
+	// Protocol matureFlwCnt: current unclaimed stock before elapsed production.
 	MatureFlowerCount int32 `protobuf:"varint,5,opt,name=mature_flower_count,json=matureFlowerCount,proto3" json:"mature_flower_count,omitempty"`
-	HarvestedCount    int32 `protobuf:"varint,6,opt,name=harvested_count,json=harvestedCount,proto3" json:"harvested_count,omitempty"`
-	LastCalcTimeMs    int64 `protobuf:"varint,7,opt,name=last_calc_time_ms,json=lastCalcTimeMs,proto3" json:"last_calc_time_ms,omitempty"`
-	// Unclaimed mature flowers (max of protocol delta and startTime+c_fmlLandLvl).
+	// Historical harvestedFlwCnt, independent of current stock.
+	HarvestedCount int32 `protobuf:"varint,6,opt,name=harvested_count,json=harvestedCount,proto3" json:"harvested_count,omitempty"`
+	LastCalcTimeMs int64 `protobuf:"varint,7,opt,name=last_calc_time_ms,json=lastCalcTimeMs,proto3" json:"last_calc_time_ms,omitempty"`
+	// Current stock plus production since lastCalcTime (or startTime), capped by stock_cap.
 	PendingHarvest int32 `protobuf:"varint,8,opt,name=pending_harvest,json=pendingHarvest,proto3" json:"pending_harvest,omitempty"`
 	// c_fmlLandLvl.stock for this land level; 0 when unknown.
 	StockCap int32 `protobuf:"varint,9,opt,name=stock_cap,json=stockCap,proto3" json:"stock_cap,omitempty"`
@@ -801,8 +811,9 @@ const file_mygardenworld_v1_workspace_union_proto_rawDesc = "" +
 	"\x15member_position_label\x18\f \x01(\tR\x13memberPositionLabel\x12.\n" +
 	"\x13race_delete_allowed\x18\r \x01(\bR\x11raceDeleteAllowed\x12H\n" +
 	"\vvideo_build\x18\x0e \x01(\v2'.mygardenworld.v1.VideoActionStatusViewR\n" +
-	"videoBuild\"\xe2\x04\n" +
-	"\vFmlRaceView\x12\x1a\n" +
+	"videoBuild\"\x90\x05\n" +
+	"\vFmlRaceView\x12,\n" +
+	"\x12auto_delete_status\x18\x11 \x01(\tR\x10autoDeleteStatus\x12\x1a\n" +
 	"\bobserved\x18\x01 \x01(\bR\bobserved\x12!\n" +
 	"\fbatch_active\x18\x02 \x01(\bR\vbatchActive\x124\n" +
 	"\x05taken\x18\x03 \x01(\v2\x1e.mygardenworld.v1.FmlRaceTakenR\x05taken\x123\n" +

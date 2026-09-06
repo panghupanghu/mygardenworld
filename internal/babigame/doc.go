@@ -115,11 +115,15 @@
 // Automatic labor hiring uses only observed ticket-gated state:
 //
 //	24.1[]       friend relations; a full 24.0+24.1 replaces, relation-only deltas merge
-//	28.5[]       opponent summaries keyed by exact int64 UID, including level
+//	28.5[]       opponent summaries keyed by exact int64 UID; IOppt.lvl is field 4
 //	115.1.5      enemy UID -> event timestamp (incremental map; null entry deletes)
 //	115.5        candidate UID -> last/current labor end timestamp (incremental subset)
 //	115.6[]      recommendation UID list (whole-list replacement)
 //
+// Only observed positive IOppt.lvl values pass the level gate: limit 0 is
+// unlimited, otherwise lvl <= limit. Unknown levels must not count as an
+// over-level rejection. Filter levels before requesting protection states,
+// and prefer a fully checked candidate over unrelated incomplete profiles.
 // Candidate summaries and hire states are trusted for 30 seconds. A contested
 // UID is cooled for 60 seconds. `pearlPlace.hire` must carry the exact observed
 // item 1003 x1 cost gate. Only this RPC inspects namespace `3.0` as the
@@ -187,12 +191,13 @@
 //	"0" = level (c_fmlLandLvl growth tier)
 //	"1" = flowerId (0 = empty)
 //	"2" = startTime (ms; plant start)
-//	"3" = matureFlwCnt (often stale until the client UI recalculates)
-//	"4" = harvestedFlwCnt
+//	"3" = matureFlwCnt (current unclaimed stock; client adds elapsed production)
+//	"4" = harvestedFlwCnt (historical harvest count, not subtracted from stock)
 //	"5" = lastCalcTime (ms)
 //
-// Pending harvest prefers max(protocol mature-harvested, startTime+c_fmlLandLvl
-// time/stock). Sync via fml.enter; mutate with fmlLand.harvest / fmlLand.plant.
+// Pending harvest follows mini's calcFmlLandMature: matureFlwCnt plus production
+// since lastCalcTime (falling back to startTime), limited by c_fmlLandLvl.stock.
+// Sync via fml.enter; mutate with fmlLand.harvest / fmlLand.plant.
 //
 // # Guild Race Task Targets (Namespace 25.114 / 25.110)
 //
@@ -206,7 +211,24 @@
 // or locked vase targets are unsafe to take; a held task with such a target
 // cannot be completed by automation.
 //
+// fmlRace.upgradeTask sends an empty object and upgrades only the current held
+// task. Mini PFmlRaceTaskUpDlg computes calFmlUpgradeCost from the task's score
+// and upgraded reward, then checks item 1 (the visible 元宝 balance, 7.0.41).
+// Automation requires an explicit switch, positive per-task budget, fresh pool
+// evidence and execution-time cost validation; an ambiguous result must not be
+// automatically retried within the same runner session.
+//
 // # Personal Land Fields (G.ILand, Namespace 100)
+//
+// Mini 176 src/assets/scripts/game.js registers message 97777 with a handler
+// returning null, but supplies no reason for the server rejection. This does
+// not establish immaturity, login expiry or success. Preserve the raw error,
+// and do not infer that the operation succeeded. Mini's onMsgDlg_97778 formats
+// args[0] as a date; c_msgCode describes temporarily unavailable role data and
+// asks the player to retry after that time. Neither artifact establishes a
+// safe deletion frequency. The runner pauses all account RPCs on either code,
+// preserves that pause across restarts, and validates a cached-session login
+// after the deadline before replanning from its full state baseline.
 //
 // Per-land fields use numeric-string keys:
 //

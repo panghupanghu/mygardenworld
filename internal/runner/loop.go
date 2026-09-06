@@ -10,6 +10,7 @@ import (
 	"github.com/SilkageNet/mygardenworld/internal/automation"
 	"github.com/SilkageNet/mygardenworld/internal/babigame"
 	"github.com/SilkageNet/mygardenworld/internal/babigame/clientproto"
+	"github.com/SilkageNet/mygardenworld/internal/babigame/clientrpc"
 	"github.com/SilkageNet/mygardenworld/internal/state"
 )
 
@@ -55,6 +56,9 @@ func (r *Runner) tickInterval() time.Duration {
 // retries at AppearTime rather than waiting out the next 4s tick.
 func (r *Runner) nextTickInterval(now time.Time) time.Duration {
 	interval := r.tickInterval()
+	if r.restrictionError() != nil {
+		return max(interval, time.Second)
+	}
 	soonest := interval
 	consider := func(at time.Time) {
 		if at.IsZero() {
@@ -106,8 +110,14 @@ func (r *Runner) soonestRaceOpCooldownUntil(now time.Time) time.Time {
 
 func (r *Runner) tick(ctx context.Context) {
 	snapshot := r.readTickSnapshot()
+	if r.restrictionError() == nil {
+		r.emitPearlHireDiagnostic(snapshot, time.Now())
+	}
 	if snapshot.sessionInvalidated || snapshot.client == nil || snapshot.session == nil {
 		r.resetSideLaneFairness()
+		return
+	}
+	if r.recoverAccountRestriction(snapshot.client, time.Now()) {
 		return
 	}
 
@@ -192,6 +202,10 @@ func (r *Runner) executeOperation(ctx context.Context, client *babigame.Client, 
 	var opErr error
 	finishOperation := r.beginOperation(op.Kind)
 	defer func() { finishOperation(opErr) }()
+	if err := r.restrictionError(); err != nil {
+		opErr = err
+		return err
+	}
 
 	if err := r.checkOperationResources(op, now); err != nil {
 		opErr = err
@@ -199,10 +213,45 @@ func (r *Runner) executeOperation(ctx context.Context, client *babigame.Client, 
 		return err
 	}
 
+	// Reserve before any delete preflight or verification RPC. Failures keep
+	// the reservation, and a manual request uses this same serialized gate.
+	if err := r.reserveRaceDelete(ctx, op, time.Now()); err != nil {
+		opErr = err
+		return err
+	}
 	if err := r.ensurePlannedOperationRqst(ctx, op); err != nil {
 		opErr = fmt.Errorf("rqst: %w", err)
 		r.handleRqstFailure(ctx, op, err, opErr)
 		return opErr
+	}
+
+	if op.Kind == clientproto.RPCFmlRaceTakeTask.String() || op.Kind == clientproto.RPCFmlRaceDelTask.String() {
+		rawRPC := babigame.NewRPCClient(
+			client,
+			session,
+			babigame.WithDefaultTimeout(30*time.Second),
+			babigame.WithApplyV(r.state.ApplyV),
+		)
+		err := preflightFmlRaceTaskMutation(ctx, operationRuntime{runner: r, rpc: clientrpc.NewClient(rawRPC)}, op)
+		if err != nil {
+			opErr = err
+			// Preflight failures return before ordinary RPC error handling. Give
+			// the rejected task its own retry delay so an unchanged snapshot or
+			// failed refresh cannot monopolize the next decision.
+			op = r.cooldownSideOperation(op, time.Now(), err, "竞赛任务执行前校验未通过", 5*time.Second)
+			r.emit(Event{
+				Kind:        "operation_deferred",
+				Category:    op.Category,
+				Domain:      op.Domain,
+				Action:      "blocked",
+				Label:       operationEventLabel(op),
+				Message:     fmt.Sprintf("%s 已跳过: %v", opDesc(op), err),
+				PayloadJSON: operationPayload(op, nil, nil, err),
+				Level:       "warn",
+			})
+			r.logOperation(ctx, op.Kind, nil, map[string]any{"error": err.Error(), "stage": "race_preflight"})
+			return err
+		}
 	}
 
 	releaseWaterLock, err := r.lockOperationWaterDrops(op, now)
