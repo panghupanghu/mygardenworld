@@ -149,6 +149,7 @@ type workspaceSession struct {
 	dirtyRedeem       bool
 	alipayLoginID     string
 	alipayPolling     bool
+	lastMaintenance   *pb.MaintenanceView
 }
 
 type alipayPollResult struct {
@@ -169,6 +170,7 @@ func newWorkspaceSession(ctx context.Context, svc *Services, conn *websocket.Con
 }
 
 func (s *workspaceSession) run(openRequestID uint64, open *pb.OpenWorkspace) error {
+	s.lastMaintenance = s.svc.maintenanceView()
 	statuses, err := s.svc.accountStatuses(s.ctx)
 	if err != nil {
 		return err
@@ -181,6 +183,7 @@ func (s *workspaceSession) run(openRequestID uint64, open *pb.OpenWorkspace) err
 		FeatureCapabilities: featureCapabilitiesProto(),
 		HeartbeatSeconds:    int32(workspaceHeartbeat.Seconds()),
 		ServerVersion:       buildinfo.GetVersion(),
+		Maintenance:         s.lastMaintenance,
 	}}); err != nil {
 		return err
 	}
@@ -280,6 +283,12 @@ func (s *workspaceSession) run(openRequestID uint64, open *pb.OpenWorkspace) err
 
 func (s *workspaceSession) handleClientFrame(frame *pb.WorkspaceClientFrame) error {
 	switch payload := frame.GetPayload().(type) {
+	case *pb.WorkspaceClientFrame_LoadNotifications:
+		view, err := s.svc.userNotifications(s.ctx, payload.LoadNotifications.GetBeforeId())
+		if err != nil {
+			return err
+		}
+		return s.send(frame.GetRequestId(), &pb.WorkspaceServerFrame_Notifications{Notifications: view})
 	case *pb.WorkspaceClientFrame_SelectAccount:
 		return s.selectAccount(frame.GetRequestId(), payload.SelectAccount.GetAccountId(), payload.SelectAccount.GetAfterLogId())
 	case *pb.WorkspaceClientFrame_Resync:
@@ -387,6 +396,15 @@ func (s *workspaceSession) acceptEvent(event runner.Event) {
 }
 
 func (s *workspaceSession) flushChanges() error {
+	maintenance := s.svc.maintenanceView()
+	if !proto.Equal(s.lastMaintenance, maintenance) {
+		s.lastMaintenance = maintenance
+		s.dirtyStatuses = true
+		s.dirtyState = s.selectedID > 0
+		if err := s.send(0, &pb.WorkspaceServerFrame_Maintenance{Maintenance: maintenance}); err != nil {
+			return err
+		}
+	}
 	if len(s.pendingLogs) > 0 {
 		logs := s.pendingLogs
 		s.pendingLogs = nil
@@ -443,6 +461,14 @@ func (s *workspaceSession) flushChanges() error {
 		}
 	}
 	return nil
+}
+
+func (svc *Services) maintenanceView() *pb.MaintenanceView {
+	if svc.Manager == nil {
+		return &pb.MaintenanceView{}
+	}
+	s := svc.Manager.MaintenanceStatus()
+	return &pb.MaintenanceView{Enabled: s.Enabled, Draining: s.Draining}
 }
 
 func (s *workspaceSession) replayMissedLogs() error {
@@ -544,6 +570,8 @@ func (s *workspaceSession) send(requestID uint64, payload any) error {
 	case *pb.WorkspaceServerFrame_AlipayLogin:
 		frame.Payload = value
 	case *pb.WorkspaceServerFrame_RedeemAttempts:
+		frame.Payload = value
+	case *pb.WorkspaceServerFrame_Notifications:
 		frame.Payload = value
 	case *pb.WorkspaceServerFrame_Error:
 		frame.Payload = value

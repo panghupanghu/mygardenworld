@@ -211,6 +211,12 @@
 // or locked vase targets are unsafe to take; a held task with such a target
 // cannot be completed by automation.
 //
+// IFmlRaceTask fields 14/15 are isUpgrade/upgradeUid. Mini 176's race UI uses
+// field 14 for the upgrade badge and field 15 to look up the upgrading member.
+// It does not establish that an upgraded row with a zero/missing upgradeUid
+// was system-upgraded. Such a row has unknown ownership, not confirmed self
+// ownership, and cannot bypass an exclude-other-upgrades policy.
+//
 // fmlRace.upgradeTask sends an empty object and upgrades only the current held
 // task. Mini PFmlRaceTaskUpDlg computes calFmlUpgradeCost from the task's score
 // and upgraded reward, then checks item 1 (the visible 元宝 balance, 7.0.41).
@@ -229,6 +235,15 @@
 // safe deletion frequency. The runner pauses all account RPCs on either code,
 // preserves that pause across restarts, and validates a cached-session login
 // after the deadline before replanning from its full state baseline.
+// Mini's c_msgCode 91102 explicitly means the login has expired; CnnMgr stops
+// and requests reloadGame on acknowledgement. If a post-deadline index.reLogin
+// returns 91102, the runner discards that rejected cache and falls back to the
+// channel login flow. It keeps the restriction until the new baseline succeeds;
+// transport failures, unknown codes and new restrictions do not trigger this
+// fallback during recovery.
+// Message envelopes may be bare numeric codes (m:91102) or objects with a
+// numeric code. Both feed the same safety classifier; unstructured error text
+// is not parsed as an authentication or request-protection code.
 //
 // Per-land fields use numeric-string keys:
 //

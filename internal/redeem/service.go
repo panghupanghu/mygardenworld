@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -21,6 +20,7 @@ import (
 
 	pb "github.com/SilkageNet/mygardenworld/gen/mygardenworld/v1"
 	"github.com/SilkageNet/mygardenworld/gen/mygardenworld/v1/mygardenworldv1connect"
+	"github.com/SilkageNet/mygardenworld/internal/outbound"
 	"github.com/SilkageNet/mygardenworld/internal/policycfg"
 	"github.com/SilkageNet/mygardenworld/internal/runner"
 	"github.com/SilkageNet/mygardenworld/internal/store"
@@ -215,6 +215,9 @@ func (s *Service) runAttempts(ctx context.Context) {
 }
 
 func (s *Service) processNextAttempt(ctx context.Context) error {
+	if s.manager != nil && s.manager.MaintenanceStatus().Enabled {
+		return nil
+	}
 	recoveredAccounts, err := s.db.RecoverExpiredRedeemAttempts(ctx, time.Now())
 	if err != nil {
 		return fmt.Errorf("recover expired redeem attempts: %w", err)
@@ -263,6 +266,9 @@ func (s *Service) eligibleAccountIDs(ctx context.Context) ([]int64, error) {
 			continue
 		}
 		allowed, err := s.accountAllowsAutoConnect(ctx, accountID)
+		if !s.manager.BackgroundStartsAllowed() {
+			continue
+		}
 		if err != nil {
 			s.log.Warn("skip redeem account with unreadable policy", "account_id", accountID, "err", err)
 			continue
@@ -351,6 +357,12 @@ func (s *Service) processAttempt(ctx context.Context, attempt *store.RedeemAttem
 		return
 	}
 	if r == nil {
+		if !s.manager.BackgroundStartsAllowed() {
+			if err := s.db.ReleaseRedeemAttempt(ctx, attempt.ID, attempt.RunToken, "维护后等待手动连接账号", nil); err != nil {
+				s.log.Error("release redeem attempt after maintenance", "err", err)
+			}
+			return
+		}
 		allowed, err := s.accountAllowsAutoConnect(ctx, attempt.AccountID)
 		if err != nil {
 			message := err.Error()
@@ -784,16 +796,8 @@ func validateSourceURL(raw string, allowPrivate bool) (*url.URL, error) {
 		return nil, errors.New("custom sources require HTTPS")
 	}
 	if !allowPrivate {
-		lookupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		ips, err := net.DefaultResolver.LookupIPAddr(lookupCtx, parsed.Hostname())
-		if err != nil {
-			return nil, fmt.Errorf("resolve source host: %w", err)
-		}
-		for _, item := range ips {
-			if item.IP.IsPrivate() || item.IP.IsLoopback() || item.IP.IsLinkLocalUnicast() || item.IP.IsUnspecified() {
-				return nil, errors.New("custom source resolves to a private or local address")
-			}
+		if err := outbound.ValidateEndpoint(parsed.String()); err != nil {
+			return nil, err
 		}
 	}
 	return parsed, nil
@@ -857,46 +861,23 @@ func parseCustomParserConfig(raw string) (customParserConfig, error) {
 }
 
 func newSourceHTTPClient(allowPrivate bool, timeout time.Duration) *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if !allowPrivate {
-		dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(address)
-			if err != nil {
-				return nil, err
-			}
-			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-			if err != nil {
-				return nil, err
-			}
-			for _, item := range ips {
-				if item.IP.IsPrivate() || item.IP.IsLoopback() || item.IP.IsLinkLocalUnicast() || item.IP.IsUnspecified() {
-					return nil, errors.New("custom source resolves to a private or local address")
-				}
-			}
-			var lastErr error
-			for _, item := range ips {
-				conn, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(item.IP.String(), port))
-				if dialErr == nil {
-					return conn, nil
-				}
-				lastErr = dialErr
-			}
-			if lastErr == nil {
-				lastErr = errors.New("source host has no addresses")
-			}
-			return nil, lastErr
-		}
+		client := outbound.NewClient(timeout)
+		client.CheckRedirect = safeRedirectPolicy(false)
+		return client
 	}
 	return &http.Client{
 		Timeout:       timeout,
-		Transport:     transport,
+		Transport:     http.DefaultTransport.(*http.Transport).Clone(),
 		CheckRedirect: safeRedirectPolicy(allowPrivate),
 	}
 }
 
 func safeRedirectPolicy(allowPrivate bool) func(*http.Request, []*http.Request) error {
-	return func(req *http.Request, _ []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("too many source redirects")
+		}
 		_, err := validateSourceURL(req.URL.String(), allowPrivate)
 		return err
 	}
