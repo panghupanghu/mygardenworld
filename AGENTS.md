@@ -53,6 +53,7 @@ web/             embedded Next.js control panel
 - Supported game channels are only iOS and Alipay. Alipay login is QR-driven and must not ask for a manual game username.
 - The Web product has eight top-level workspaces: basic, garden, orders, union, activities, warehouse, statistics, and logs.
 - Each business workspace owns its status and settings. Warehouse is inventory-only; statistics contains aggregated history; logs contains structured execution/runtime records and no settings.
+- Settings remain accessible without a live game session or confirmed membership/unlocks. Configuration access is not execution permission; runner and planner state gates remain authoritative.
 - Union land, construction, and race behavior require authoritative current-cycle membership evidence. Never plan union work from stale snapshots for an account that is not confirmed as a member.
 - Supported activities are 花笺集芳 (`tmpType 4002`) and 莳花纪闻 (`tmpType 4003`). Removed activities must not remain in policy, state, API, or UI compatibility paths.
 
@@ -67,6 +68,7 @@ web/             embedded Next.js control panel
 - Policy, planner, runner events, and Web filters share `basic`, `plant`, `order`, `water`, `union`, `race`, and `activity`; operational events use `account` and `system`.
 - Automation normally evaluates every 4 seconds. Hard state/resource gates precede harvest, planting/order deficits, watering, orders/flower art, cultivation/upgrades, basic rewards, union, secondary systems, and activities.
 - Per-account request pacing covers manual commands and executor-internal batches as well as scheduled operations. Heartbeat pacing stays independent, but maintenance and request-protection guards still apply to it. Local spacing is not evidence of a server-side safe threshold.
+- Race-state notifications only wake the existing serialized decision loop. Split independent scheduled RPC batches at safe result boundaries; never interrupt a paid mutation before confirmation. Reusing a race task pool requires recent full-list evidence, not a push timestamp, and does not replace send-time policy/task guards.
 - Every mutating operation with gold, diamond, item, water-drop, or count cost must pass observed-state resource gates. Diamond-cost operations remain blocked unless explicitly and safely implemented. Watering one land consumes one drop.
 
 ## Breaking changes and persistence

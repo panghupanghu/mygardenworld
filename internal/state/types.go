@@ -388,13 +388,16 @@ type FmlRaceView struct {
 	// was last confirmed by getTaskList. A successful no-change delta advances it
 	// when TasksObserved is already true.
 	TasksSyncedAtMs int64
-	BatchActive     bool              // true if status/time window indicates an active race
-	BatchID         int64             // CurFmlRaceBatch.batchId (field 0; millisecond timestamp)
-	BatchStatus     int32             // raw Status value from server (field 1 of CurFmlRaceBatch)
-	BatchStartMs    int64             // race batch start time in ms (field 2)
-	BatchEndMs      int64             // race batch end time in ms (field 3)
-	Tasks           []FmlRaceTaskView // available task pool (field 114)
-	Taken           FmlRaceTakenView  // current user's taken task (from field 110)
+	// FullTasksSyncedAtMs advances only for a decoded, complete getTaskList
+	// response. Pushes and empty acknowledgements cannot renew this evidence.
+	FullTasksSyncedAtMs int64
+	BatchActive         bool              // true if status/time window indicates an active race
+	BatchID             int64             // CurFmlRaceBatch.batchId (field 0; millisecond timestamp)
+	BatchStatus         int32             // raw Status value from server (field 1 of CurFmlRaceBatch)
+	BatchStartMs        int64             // race batch start time in ms (field 2)
+	BatchEndMs          int64             // race batch end time in ms (field 3)
+	Tasks               []FmlRaceTaskView // available task pool (field 114)
+	Taken               FmlRaceTakenView  // current user's taken task (from field 110)
 	// TaskQuotaObserved is true after field 110 (usr rcd) was applied.
 	TaskQuotaObserved bool
 	// FinishedTaskNum is IFmlRaceUsrRcd.fTaskNum (completed tasks this batch).
@@ -704,6 +707,8 @@ type MainTaskClaimSnapshot struct {
 // CyclicNoteView is a defensive snapshot of the dynamically selected
 // 花笺集芳 (tmpType 4002) activity in namespace 23.
 type CyclicNoteView struct {
+	EnterReady                bool
+	TaskListValid             bool
 	Observed                  bool
 	Found                     bool
 	Valid                     bool
@@ -846,7 +851,7 @@ type CyclicStoryMilestoneClaimSnapshot struct {
 
 // CyclicNoteEnterSnapshot freezes the exact active batch before an enter RPC.
 // Enter is only safe while the batch is in its active or reward-grace phase
-// and before its authoritative task list has been observed.
+// and its authoritative task/resource/template state still needs initialization.
 type CyclicNoteEnterSnapshot struct {
 	At      time.Time
 	BatchID int32
