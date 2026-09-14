@@ -39,7 +39,7 @@ type Manager struct {
 
 	mu        sync.RWMutex
 	runners   map[int64]*Runner
-	opLocks   map[int64]*sync.Mutex
+	opLocks   map[int64]*accountLifecycleLock
 	lastStats map[int64]RuntimeStatsSnapshot
 	// lastDiag keeps the final diagnostics after a runner exits so status can
 	// still surface session-invalidation (e.g. phone login kick) as 异常
@@ -85,7 +85,7 @@ func NewManager(db *store.DB, bus *Bus, log *slog.Logger) *Manager {
 		bus:       bus,
 		log:       log,
 		runners:   make(map[int64]*Runner),
-		opLocks:   make(map[int64]*sync.Mutex),
+		opLocks:   make(map[int64]*accountLifecycleLock),
 		lastStats: make(map[int64]RuntimeStatsSnapshot),
 		lastDiag:  make(map[int64]Diagnostics),
 		pacers:    make(map[int64]*requestPacer),
@@ -243,29 +243,61 @@ func (m *Manager) StartWithSource(ctx context.Context, accountID int64, source S
 	}
 	defer release()
 	lock := m.accountLock(accountID)
-	lock.Lock()
+	if err := lock.LockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer lock.Unlock()
-	return m.start(ctx, accountID, source)
+	return m.start(ctx, accountID, source, false)
 }
 
-func (m *Manager) accountLock(accountID int64) *sync.Mutex {
+// StartAutomation completes an explicit connection/enable command under the
+// account lifecycle lock. A new runner is not registered until activation is
+// persisted; cancellation or activation failure closes its connection instead
+// of leaving an apparently online, automation-disabled runner behind.
+func (m *Manager) StartAutomation(ctx context.Context, accountID int64, source StartSource, reconnect bool) (*Runner, error) {
+	ctx, release, err := m.BeginGameWork(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	lock := m.accountLock(accountID)
+	if err := lock.LockContext(ctx); err != nil {
+		return nil, err
+	}
+	defer lock.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if reconnect {
+		_ = m.stop(accountID)
+	}
+	return m.start(ctx, accountID, source, true)
+}
+
+func (m *Manager) accountLock(accountID int64) *accountLifecycleLock {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	lock := m.opLocks[accountID]
 	if lock == nil {
-		lock = &sync.Mutex{}
+		lock = &accountLifecycleLock{token: make(chan struct{}, 1)}
 		m.opLocks[accountID] = lock
 	}
 	return lock
 }
 
-func (m *Manager) start(ctx context.Context, accountID int64, source StartSource) (*Runner, error) {
+func (m *Manager) start(ctx context.Context, accountID int64, source StartSource, activate bool) (*Runner, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	m.mu.Lock()
 	if r, ok := m.runners[accountID]; ok {
 		m.mu.Unlock()
+		if activate {
+			// Failure must not tear down a runner owned by an earlier command.
+			if err := r.enableAutomation(ctx); err != nil {
+				return nil, err
+			}
+		}
 		return r, nil
 	}
 	if m.manualResumeRequired && (source == StartSourceRedeemAutoConnect || source == StartSourceDaemonRestore) {
@@ -322,7 +354,7 @@ func (m *Manager) start(ctx context.Context, accountID int64, source StartSource
 		}
 	}
 	m.log.Info("starting account session", "account_id", acc.ID, "account", acc.Name, "source", source)
-	if err := r.Start(ctx); err != nil {
+	if err := r.start(ctx, activate); err != nil {
 		m.log.Warn("start account session failed", "account_id", acc.ID, "account", acc.Name, "source", source, "err", err)
 		return nil, err
 	}
@@ -383,10 +415,12 @@ func (m *Manager) ReloadWithSource(ctx context.Context, accountID int64, source 
 	}
 	defer release()
 	lock := m.accountLock(accountID)
-	lock.Lock()
+	if err := lock.LockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer lock.Unlock()
 	_ = m.stop(accountID)
-	return m.start(ctx, accountID, source)
+	return m.start(ctx, accountID, source, false)
 }
 
 // Shutdown stops every runner. Used at daemon exit.
@@ -398,7 +432,7 @@ func (m *Manager) Shutdown() {
 	m.mu.Lock()
 	runners := m.runners
 	m.runners = make(map[int64]*Runner)
-	m.opLocks = make(map[int64]*sync.Mutex)
+	m.opLocks = make(map[int64]*accountLifecycleLock)
 	m.mu.Unlock()
 	for _, r := range runners {
 		r.Stop()

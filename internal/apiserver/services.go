@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	connect "connectrpc.com/connect"
 
@@ -122,12 +123,9 @@ func (svc *Services) CreateAccount(ctx context.Context, req *connect.Request[pb.
 		acc = updated
 	}
 	resp := &pb.CreateAccountResponse{Account: store.AccountToProto(acc)}
-	if r, err := svc.Manager.StartWithSource(ctx, acc.ID, runner.StartSourceAccountCreate); err != nil {
+	if r, err := svc.startAutomation(ctx, acc.ID, runner.StartSourceAccountCreate, false); err != nil {
 		resp.LoginError = formatLoginErr(err)
 	} else {
-		if err := svc.enableAutomation(ctx, acc.ID, r); err != nil {
-			resp.LoginError = formatLoginErr(err)
-		}
 		out := store.AccountToProto(r.Account())
 		out.Connected = r.Connected()
 		resp.Account = out
@@ -150,12 +148,13 @@ func formatLoginErr(err error) string {
 }
 
 func (svc *Services) DeleteAccount(ctx context.Context, req *connect.Request[pb.DeleteAccountRequest]) (*connect.Response[pb.DeleteAccountResponse], error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
 	acc, err := svc.resolveAccount(ctx, req.Msg.GetId())
 	if err != nil {
 		return nil, mapErr(err)
 	}
-	_ = svc.Manager.Stop(acc.ID)
-	if err := svc.DB.DeleteAccount(ctx, acc.ID); err != nil {
+	if err := svc.Manager.DeleteAccount(ctx, acc.ID); err != nil {
 		return nil, mapErr(err)
 	}
 	return connect.NewResponse(&pb.DeleteAccountResponse{}), nil
@@ -186,11 +185,8 @@ func (svc *Services) ConnectAccount(ctx context.Context, req *connect.Request[pb
 	if err != nil {
 		return nil, mapErr(err)
 	}
-	r, err := svc.Manager.ReloadWithSource(ctx, acc.ID, runner.StartSourceControlPanel)
+	r, err := svc.startAutomation(ctx, acc.ID, runner.StartSourceControlPanel, true)
 	if err != nil {
-		return nil, mapErr(err)
-	}
-	if err := svc.enableAutomation(ctx, acc.ID, r); err != nil {
 		return nil, mapErr(err)
 	}
 	out := store.AccountToProto(r.Account())
@@ -206,11 +202,12 @@ func (svc *Services) DisconnectAccount(ctx context.Context, req *connect.Request
 	if err != nil {
 		return nil, mapErr(err)
 	}
-	r := svc.Manager.Get(acc.ID)
-	if err := svc.disableAutomation(ctx, acc.ID, r); err != nil {
+	if err := svc.Manager.PauseAutomation(ctx, acc.ID, true); err != nil {
 		return nil, mapErr(err)
 	}
-	_ = svc.Manager.Stop(acc.ID)
+	if svc.Redeem != nil {
+		svc.Redeem.NotifyAccountPolicyChanged()
+	}
 	// Stop is a no-op when the runner already exited after a kick; still clear
 	// the cached 异常 reason so an intentional stop returns to plain offline.
 	svc.Manager.ClearLastDiagnostics(acc.ID)
@@ -221,6 +218,10 @@ func (svc *Services) DisconnectAccount(ctx context.Context, req *connect.Request
 
 func mapErr(err error) error {
 	switch {
+	case errors.Is(err, context.Canceled):
+		return connect.NewError(connect.CodeCanceled, err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return connect.NewError(connect.CodeDeadlineExceeded, err)
 	case errors.Is(err, runner.ErrMaintenance):
 		return connect.NewError(connect.CodeUnavailable, err)
 	case errors.Is(err, sql.ErrNoRows):
