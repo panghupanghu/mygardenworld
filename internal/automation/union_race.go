@@ -925,15 +925,17 @@ func RaceTakeSkipReason(s *state.State, t state.FmlRaceTaskView, policy *pb.Unio
 	if t.UID != 0 {
 		return "已被接取"
 	}
+	// Keep policy/state restrictions visible even while the slot is cooling.
+	// AppearTime carries the independent refresh deadline to the read model.
+	if reason := raceTakeNonCDSkipReason(s, t, policy, uid, gates); reason != "" {
+		return reason
+	}
 	leadUntil := now.Add(raceTakeLeadWindow).UnixMilli()
 	if t.AppearTime > 0 && t.AppearTime > leadUntil {
 		hhmmss := time.UnixMilli(t.AppearTime).Local().Format("15:04:05")
-		if raceTakeNonCDSkipReason(s, t, policy, uid, gates) != "" {
-			return hhmmss + " 后刷新"
-		}
 		return "冷却中，" + hhmmss + " 后可接"
 	}
-	return raceTakeNonCDSkipReason(s, t, policy, uid, gates)
+	return ""
 }
 
 // ManualRaceTakeOperation validates a user-selected task against the same
@@ -1171,16 +1173,15 @@ func raceTakeNonCDSkipReason(s *state.State, t state.FmlRaceTaskView, policy *pb
 	if policy.GetOnlyUpgradeTask() && t.IsUpgrade == 0 {
 		return "仅接已升级任务"
 	}
-	// Mini uses isUpgrade for the upgrade badge and upgradeUid for the member
-	// identity independently. A missing/zero UID is not evidence of a system
-	// upgrade: when exclusion is enabled, only positively identified self
-	// upgrades may pass. Ordinary unupgraded tasks remain eligible.
-	if policy.GetExcludeOthersUpgradeTask() {
-		if t.UpgradeUid > 0 && t.UpgradeUid != uid {
-			return "他人已升级"
+	// Occupancy is checked separately via UID. IsUpgrade is only the badge;
+	// an absent upgrade member does not establish another player's ownership
+	// (nor prove a system upgrade), so keep evaluating the user's other filters.
+	if policy.GetExcludeOthersUpgradeTask() && t.UpgradeUid > 0 {
+		if uid <= 0 {
+			return "当前账号身份尚未同步"
 		}
-		if (t.IsUpgrade != 0 || t.UpgradeUid != 0) && (t.UpgradeUid <= 0 || uid <= 0) {
-			return "升级归属不明，已跳过"
+		if t.UpgradeUid != uid {
+			return "他人已升级"
 		}
 	}
 	taskType := t.TaskType

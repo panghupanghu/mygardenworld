@@ -13,6 +13,8 @@ it("shows independent recovery opt-in and displacement warning while offline", (
   expect(html).toContain("默认关闭");
   expect(html).toContain("可能挤下手机端");
   expect(html).toContain("与自动挤号设置独立");
+  expect(html).toContain("不先重试旧会话");
+  expect(html).toContain("暂停/启动不会重置冷却和额度");
 });
 
 describe("race upgrade configuration explains spending permission", () => {
@@ -32,4 +34,14 @@ describe("race upgrade configuration explains spending permission", () => {
     expect(onChange).not.toHaveBeenCalled();
     expect(onSave).not.toHaveBeenCalled();
   });
+});
+
+it("explains that upgrade member exclusion does not imply task occupancy", () => {
+  const html = renderToStaticMarkup(<PolicyPanel policy={create(PolicySchema)} section="union"
+    basicView={null} garden={null} orders={null} warehouse={null} unionView={null}
+    capabilities={[]} loading={false} saving={false} message="" onPolicyChange={vi.fn()} onSave={vi.fn()} />);
+  expect(html).toContain("仅排除明确由其他成员升级的任务");
+  expect(html).toContain("未记录升级人的任务仍按其余条件筛选");
+  expect(html).toContain("已被接取的任务始终跳过");
+  expect(html).not.toContain("已升级但归属不明的任务");
 });

@@ -345,7 +345,7 @@ export default function PolicyPanel({
                   label="5000 异常后允许重新登录"
                   checked={basic?.serverErrorFreshLoginEnabled ?? false}
                   onChange={(checked) => updateBasic({ serverErrorFreshLoginEnabled: checked })}
-            description="默认关闭。5000 保护冷却后，旧会话仍返回 5000 或明确过期时，允许重新认证一次，可能挤下手机端。每次异常最多一次，两次尝试至少间隔 30 分钟；暂停时不尝试。与自动挤号设置独立，业务核验通过后才恢复操作。"
+            description="默认关闭。开启后，5000 首次保护冷却结束且额度可用时，直接重新认证，不先重试旧会话，可能挤下手机端。每次异常最多一次，两次尝试至少间隔 30 分钟；暂停时不尝试，暂停/启动不会重置冷却和额度。与自动挤号设置独立，业务核验通过后才恢复操作。"
                 />
               </div>
             </PolicyGroup>
@@ -647,7 +647,7 @@ export default function PolicyPanel({
                 <ToggleRow label="种植任务使用加速卡" checked={unionRace?.useSpeedupTicketInTask ?? false} description="已接种植收获任务全程可用加速卡。关闭时仍强制保底：任务最后 10 分钟自动对竞赛花使用加速卡" onChange={(checked) => updateUnionRace({ useSpeedupTicketInTask: checked })} />
                 <NumberRow label="最低任务分" value={unionRace?.minTaskScore ?? 0} min={0} description="自动接取会跳过分数不高于此值的任务；只有另行开启自动放弃后，已接任务才会受此限制。0 表示不限制" onChange={(value) => updateUnionRace({ minTaskScore: value })} />
                 <ToggleRow label="只接已升级任务" checked={unionRace?.onlyUpgradeTask ?? false} description="只接取已被升级的任务（积分加成更高）" onChange={(checked) => updateUnionRace({ onlyUpgradeTask: checked })} />
-                <ToggleRow label="排除他人升级任务" checked={unionRace?.excludeOthersUpgradeTask ?? true} description="跳过他人升级及已升级但归属不明的任务，允许自己升级的任务；同时约束自动与手动接取，不影响已经持有的任务" onChange={(checked) => updateUnionRace({ excludeOthersUpgradeTask: checked })} />
+                <ToggleRow label="排除他人升级任务" checked={unionRace?.excludeOthersUpgradeTask ?? true} description="仅排除明确由其他成员升级的任务；未记录升级人的任务仍按其余条件筛选，已被接取的任务始终跳过。适用于自动与手动接取，不影响已持有任务" onChange={(checked) => updateUnionRace({ excludeOthersUpgradeTask: checked })} />
                 <ToggleRow label="自动升级任务" checked={unionRace?.upgradeTask ?? false} description="独立于自动完成；升级当前持有的未完成任务，消耗元宝。结果未确认时不会重复提交" onChange={(checked) => updateUnionRace({ upgradeTask: checked })} status={settingStatusForCapability(capabilities, "union.race.upgrade")} />
                 <BigIntNumberRow label="单次升级元宝上限" description="0 表示禁止消费；每个任务升级前核对实际费用与可用余额" value={unionRace?.maxSpendDiamond ?? BigInt(0)} min={0} onChange={(value) => updateUnionRace({ maxSpendDiamond: value })} />
                 {unionRace?.upgradeTask && (unionRace.maxSpendDiamond <= BigInt(0)) && (
