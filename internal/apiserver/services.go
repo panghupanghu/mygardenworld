@@ -38,6 +38,8 @@ type Services struct {
 	Redeem        *redeemsvc.Service
 	RedeemLimiter *RedeemSubmitLimiter
 
+	identityProbes identityProbeGuard
+
 	workspaceProjectionMu sync.Mutex
 	workspaceProjections  map[int64]*workspaceProjectionCache
 }
@@ -45,6 +47,14 @@ type Services struct {
 // resolveAccount resolves the only public account identity: its stable id.
 // Every user, including admins, can only access their own game accounts.
 func (svc *Services) resolveAccount(ctx context.Context, id int64) (*store.Account, error) {
+	acc, err := svc.resolveAccountIncludingDeleting(ctx, id)
+	if err == nil && acc.DeletionPending {
+		return nil, mapErr(store.ErrAccountDeleting)
+	}
+	return acc, err
+}
+
+func (svc *Services) resolveAccountIncludingDeleting(ctx context.Context, id int64) (*store.Account, error) {
 	userID, err := requireUserID(ctx)
 	if err != nil {
 		return nil, err
@@ -52,7 +62,7 @@ func (svc *Services) resolveAccount(ctx context.Context, id int64) (*store.Accou
 	if id <= 0 {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("valid account id required"))
 	}
-	acc, err := svc.DB.GetAccountByID(ctx, id)
+	acc, err := svc.DB.GetAccountIncludingDeleting(ctx, id)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -91,6 +101,9 @@ func (svc *Services) CreateAccount(ctx context.Context, req *connect.Request[pb.
 	if channelStr == string(babigame.ChannelAlipay) {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("alipay accounts must use StartAlipayLogin"))
 	}
+	if _, err := svc.DB.GetAccountByChannelUsername(ctx, userID, channelStr, username); err != nil && !errors.Is(err, store.ErrAccountNotFound) {
+		return nil, mapErr(err)
+	}
 	initialPolicy, err := svc.initialAccountPolicy(ctx, in.GetInitialPolicyAccountId())
 	if err != nil {
 		return nil, err
@@ -108,7 +121,7 @@ func (svc *Services) CreateAccount(ctx context.Context, req *connect.Request[pb.
 	}
 	session, err := svc.probeAccountIdentity(ctx, channelStr, username, password)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("login: %s", formatLoginErr(err)))
+		return nil, accountLoginError(err)
 	}
 	name, err := svc.DB.UniqueAccountName(ctx, userID, 0, babigame.DisplayNameFromSession(session, username))
 	if err != nil {
@@ -150,14 +163,14 @@ func formatLoginErr(err error) string {
 func (svc *Services) DeleteAccount(ctx context.Context, req *connect.Request[pb.DeleteAccountRequest]) (*connect.Response[pb.DeleteAccountResponse], error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	acc, err := svc.resolveAccount(ctx, req.Msg.GetId())
+	acc, err := svc.resolveAccountIncludingDeleting(ctx, req.Msg.GetId())
 	if err != nil {
 		return nil, mapErr(err)
 	}
 	if err := svc.Manager.DeleteAccount(ctx, acc.ID); err != nil {
 		return nil, mapErr(err)
 	}
-	return connect.NewResponse(&pb.DeleteAccountResponse{}), nil
+	return connect.NewResponse(&pb.DeleteAccountResponse{DeletionPending: true}), nil
 }
 
 func (svc *Services) ListAccounts(ctx context.Context, _ *connect.Request[pb.ListAccountsRequest]) (*connect.Response[pb.ListAccountsResponse], error) {
@@ -165,7 +178,7 @@ func (svc *Services) ListAccounts(ctx context.Context, _ *connect.Request[pb.Lis
 	if err != nil {
 		return nil, err
 	}
-	accounts, err := svc.DB.ListAccounts(ctx, userID)
+	accounts, err := svc.DB.ListAccountsIncludingDeleting(ctx, userID)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -222,6 +235,8 @@ func mapErr(err error) error {
 		return connect.NewError(connect.CodeCanceled, err)
 	case errors.Is(err, context.DeadlineExceeded):
 		return connect.NewError(connect.CodeDeadlineExceeded, err)
+	case errors.Is(err, store.ErrAccountDeleting):
+		return connect.NewError(connect.CodeFailedPrecondition, err)
 	case errors.Is(err, runner.ErrMaintenance):
 		return connect.NewError(connect.CodeUnavailable, err)
 	case errors.Is(err, sql.ErrNoRows):
