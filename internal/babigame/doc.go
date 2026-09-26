@@ -30,6 +30,12 @@
 // common session1/uuid/lang/appInfo filter after building their signed payload.
 // Native startup must consume the UUID in queryPackageConfig's launch URL and
 // the subsequent queryInitParams response before password authentication.
+// Alipay instead calls /pack/init/packageName/cn.hysj.zfb.minigame with the
+// observed executable version 450.0.15, then consumes userParams for UUID,
+// session options and YXT channel routing before exchanging the web grant.
+// A same-input comparison on 2026-09-23 routed 412.0.4 to aud-zfb and 450.0.15
+// to prod. The returned SDK entry gameVersion (2.2.209) must not overwrite
+// the executable version sent in appInfo or GW/GS login requests.
 // Read-only observations on 2026-09-23 found session1Cipher=1 with no mdSession1
 // in the iOS init response; random UUIDs were rejected with "params is null".
 // The meaning of 902054 and a causal link to this SDK change remain unverified.
@@ -73,8 +79,8 @@
 //	119        | High-freq task counters          | Most RPCs
 //	124        | Daily summary / popup rewards    | harvest, orders
 //	130        | Cultivation & art rewards        | cultivate.recv
-//	131        | Observed high-frequency delta     | land, task, pass, random-event RPCs
-//	132        | Observed order/pass delta          | orderFlower, flowerElvesPass
+//	131        | Land, task and flower-pass delta   | land, task, flowerPass.*, random-event RPCs
+//	132        | Order, flower-elf and pass delta   | orderFlower, flowerElves.*, flowerElvesAid.*, flowerElvesPass.*
 //	140        | Stateful anti-fraud daily reward   | signType.enter/sign/recv
 //	148        | Observed broad activity delta      | Most reward/activity RPCs
 //	165        | Celebrity state (legacy)          | older celebrity responses
@@ -469,7 +475,7 @@
 //	frdExt.buyStealCnt   {frdUid,buyCnt:1}        → {7,24,...}       costs c_frd.$pickAddCost item 1305
 //	frdSteal.enterFrdSteal {point:[22,deviceFingerprint]} → {111,...}
 //	frdHome.getFrdHomeInfo {frdUid}              → {133,...}
-//	frdSteal.steal      {frdUid,landId,stealElves:0} → {7,111,...}
+//	frdSteal.steal      {frdUid,landId,stealElves:0|1} → {7,111,...}; 1 requests an elf, but confirm the elf counter/UID/inventory delta
 //	pearl.getHireStateByUids {uids:[uid]}          → {115.5}
 //	pearl.getRecommendList {}                      → {115.5,115.6}
 //	pearlPlace.hire      {placeId,dstUid}           → {7,115,...}

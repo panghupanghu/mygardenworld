@@ -69,6 +69,8 @@ func (r *Runner) start(ctx context.Context, activate bool) error {
 
 	r.installStateHandlers()
 	r.hydratePearlHireTicketUsage(ctx, time.Now())
+	r.hydrateSpeedUpTicketReservations(ctx, time.Now())
+	r.hydrateElvesAidHelpReservations(ctx, time.Now())
 	if err := r.loadAccountSafety(ctx); err != nil {
 		return fail(err)
 	}
@@ -233,6 +235,11 @@ func (r *Runner) connectFresh(ctx context.Context, username, password string) (*
 
 func (r *Runner) prepareHTTPClient(ctx context.Context, deviceID, uuid, session0 string) *babigame.HTTPClient {
 	httpc := babigame.NewHTTPClient(r.cfg, deviceID, uuid, session0)
+	if !r.cfg.IsNative {
+		// Alipay initializes through pack/init only when a fresh login is
+		// needed. Restoring a session must retain its authenticated UUID.
+		return httpc
+	}
 	if pkg, err := httpc.QueryPackageConfig(ctx); err == nil {
 		if pkg.GameVersion != "" {
 			httpc.Cfg.GameVersion = pkg.GameVersion
