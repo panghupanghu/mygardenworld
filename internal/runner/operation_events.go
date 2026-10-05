@@ -182,6 +182,15 @@ func (r *Runner) emitOperationPlanned(attempt operationAttempt) {
 
 func (r *Runner) handleOperationError(ctx context.Context, result operationResult) error {
 	op, args, err := result.op, result.args, result.err
+	var taken *pearlHireCandidateTakenError
+	if op.Kind == clientproto.RPCPearlPlaceHire.String() && errors.As(err, &taken) {
+		r.clearOperationCooldown(op)
+		r.emit(Event{Kind: "operation_deferred", Category: op.Category, Domain: op.Domain,
+			Action: "blocked", Label: operationEventLabel(op), Level: "info",
+			Message: taken.Error(), PayloadJSON: operationPayload(op, args, nil, err)})
+		r.logOperation(ctx, op.Kind, args, map[string]any{"error": taken.Error(), "stage": "candidate_taken"})
+		return nil
+	}
 	if isFriendStealElvesUnavailableError(op, err) {
 		r.state.MarkFriendStealElvesLandUnavailable(op.TargetUID, op.TargetID)
 		r.state.ClearFriendElvesSkipEnter(op.TargetUID)
@@ -707,12 +716,15 @@ func (r *Runner) handleRaceSyncFailure(ctx context.Context, result operationResu
 		r.state.MarkFmlRaceTaskPoolStale()
 	}
 	reason := "竞赛同步失败，稍后重试"
-	message := fmt.Sprintf("%s 暂缓: 同步失败，1 秒后重试", opDesc(op))
 	if isRaceTransientSessionError(op.Kind, err) {
 		reason = "竞赛会话需重新进入，稍后重试"
-		message = fmt.Sprintf("%s 暂缓: 竞赛会话需重新进入，1 秒后重试", opDesc(op))
 	}
-	payloadOp := r.cooldownSideOperation(op, result.finishedAt, err, reason, raceSyncRetryCooldown)
+	payloadOp := r.cooldownSideOperation(op, result.finishedAt, err, reason, 0)
+	wait := payloadOp.CooldownUntil.Sub(result.finishedAt)
+	message := fmt.Sprintf("%s 暂缓: %s，%d 秒后重试", opDesc(op), reason, int(wait.Seconds()))
+	if protected := r.restrictionError(); protected != nil {
+		message = fmt.Sprintf("%s 暂缓: %v；等待账号恢复核验", opDesc(op), protected)
+	}
 	r.emit(Event{
 		Kind:        "operation_deferred",
 		Category:    op.Category,
@@ -726,7 +738,7 @@ func (r *Runner) handleRaceSyncFailure(ctx context.Context, result operationResu
 	r.logOperation(ctx, op.Kind, args, map[string]any{
 		"error":             err.Error(),
 		"stage":             stage,
-		"retryAfterSeconds": int(raceSyncRetryCooldown.Seconds()),
+		"retryAfterSeconds": int(wait.Seconds()),
 	})
 	return nil
 }

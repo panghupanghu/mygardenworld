@@ -155,6 +155,10 @@
 // labor state, policy, slots and tickets after request pacing; candidate level
 // and labor evidence must both be younger than 30 seconds. A local pre-send
 // veto does not lock the session, while an ambiguous sent hire still does.
+// Observed pearlPlace.hire rejection code "pearl_tips4" means the candidate
+// was hired by someone else. With no contradictory payload/ticket decrement,
+// cool only that UID and invalidate its profile/protection cache; never replay
+// the hire. Unknown server errors and transport timeouts still lock hiring.
 // A contested UID is cooled for 60 seconds. `pearlPlace.hire` must carry the exact observed
 // item 1003 x1 cost gate. Only this RPC inspects namespace `3.0` as the
 // client-side `$ext.iv`: exact zero is safe; nonzero makes the official client
@@ -278,7 +282,10 @@
 // automatically retried within the same runner session.
 //
 // Error 5000 has been observed across harvest, orders, pearl rewards and
-// health-score reads in user logs, but its server-side meaning is unconfirmed.
+// health-score reads. The bundled client c_msgCode maps 5000 to dialog type
+// 97778; both texts describe unavailable role data, possibly related to
+// third-party tools, and ask the player to retry later. This is evidence of a
+// temporary restriction, not proof of its trigger, a ban or a safe request rate.
 // Repeated cross-RPC failures are handled by runner account request protection;
 // the protocol layer must not classify 5000 alone as displacement or expiry.
 //
