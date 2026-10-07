@@ -168,6 +168,13 @@
 // that UID for the current session. Malformed-present data or an otherwise
 // ambiguous result locks automatic hiring for the rest of the session.
 //
+// Automatic recvOneKey requires its own collect_enabled policy; enabling hire,
+// free rewards, draw or protection does not authorize production collection.
+// The account pacer spaces collection attempts by collect_interval_seconds
+// (default 300, range 60..3600), including failed attempts. Ordinary reconnects
+// preserve this in-memory spacing; daemon restarts do not persist pacing.
+// These local intervals are not observed server-side safety guarantees.
+//
 // # Friend Flower Pick State (Namespaces 24, 110, 111)
 //
 // Automatic friend flower picking is driven only by observed state:
@@ -306,6 +313,11 @@
 // channel login flow. It keeps the restriction until the new baseline succeeds;
 // transport failures, unknown codes and new restrictions do not trigger this
 // fallback during recovery.
+// Local recovery admission (paused automation, missing authentication opt-in,
+// or exhausted automatic login allowance) is not a server response and never
+// extends this deadline. It waits for settings or explicit user login. A manual
+// Connect can authorize one fresh authentication without enabling automatic
+// relogin; it still honors the server deadline and durable login spacing.
 // Message envelopes may be bare numeric codes (m:91102) or objects with a
 // numeric code. Both feed the same safety classifier; unstructured error text
 // is not parsed as an authentication or request-protection code.

@@ -3,9 +3,9 @@ package runner
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/SilkageNet/mygardenworld/internal/babigame"
@@ -30,7 +30,13 @@ func (r *Runner) beforeGameRPC(ctx context.Context, name string) (err error) {
 	if err := r.waitRaceTakeReady(ctx, name); err != nil {
 		return err
 	}
-	if err := r.pacer.wait(ctx, name, func() error { return r.checkGameRPCContext(ctx, name) }); err != nil {
+	guardRequest := func() error {
+		if err := r.checkGameRPCContext(ctx, name); err != nil {
+			return err
+		}
+		return r.validatePearlCollectBeforeSend(ctx, name)
+	}
+	if err := r.pacer.wait(ctx, name, guardRequest); err != nil {
 		return err
 	}
 	if err := r.validateActivitySyncBeforeSend(ctx, name); err != nil {
@@ -69,6 +75,9 @@ func (r *Runner) checkGameRPCContext(ctx context.Context, name string) error {
 	s, revision := r.accountSafetySnapshot()
 	if s.RestrictionCode == 0 {
 		return nil
+	}
+	if ctx.Value(recoveryAttemptKey{}) == r && !r.Policy().GetAutomationEnabled() {
+		return &recoveryBlockedError{reason: "自动化已暂停，取消尚未发送的恢复请求；未延长服务端冷却"}
 	}
 	if time.Now().UnixMilli() >= s.RestrictedUntilMS {
 		if name == clientproto.RPCIndexLogin.String() || name == clientproto.RPCIndexReLogin.String() {
@@ -165,6 +174,9 @@ func (r *Runner) recordAccountRestrictionLocked(name string, d babigame.WSRespon
 		name, d.ErrorCode(), time.UnixMilli(next.RestrictedUntilMS).Local().Format("01/02 15:04:05"))
 	if next.RestrictionCode == 5000 {
 		message += "；短时间跨接口重复失败或恢复验证仍失败，已触发本地请求保护；保留自动化设置，不重放失败操作"
+		if previous.RestrictionCode == 0 && len(failureRPCs) > 0 {
+			message += "；本次触发前 60 秒失败顺序：" + strings.Join(failureRPCs, " → ") + "（最后一次失败不代表根因）"
+		}
 	}
 	if err != nil {
 		message += fmt.Sprintf("；保护状态保存失败，当前进程仍保持暂停: %v", err)
@@ -296,32 +308,4 @@ func (r *Runner) recoverAccountRestriction(client *babigame.Client, now time.Tim
 		_ = client.Close()
 	}
 	return true
-}
-
-func (r *Runner) deferRestrictionProbe(revision uint64, probeErr error) {
-	r.safetyMu.Lock()
-	// A coded failure was already recorded by the response observer.
-	if r.safetyRevision != revision || r.safety.RestrictionCode == 0 {
-		r.safetyMu.Unlock()
-		return
-	}
-	// A positively expired cached token advances recovery backoff. Transport
-	// failures and arbitrary error text do not establish token expiry. Fresh
-	// authentication keeps its independent opt-in, cooldown and durable budget.
-	var rejected *babigame.RPCServerError
-	if r.safety.RestrictionCode == 5000 && errors.As(probeErr, &rejected) && rejected.Name == clientproto.RPCIndexReLogin &&
-		rejected.Envelope.ErrorCode() == 91102 && !rejected.Envelope.IsSessionDisplaced() {
-		r.safety.RestrictionAttempts = min(4, r.safety.RestrictionAttempts+1)
-	}
-	wait := restrictionBackoff(r.safety.RestrictionAttempts)
-	r.safety.RestrictedUntilMS = time.Now().Add(wait).UnixMilli()
-	r.safetyRevision++
-	err := r.persistRestrictionLocked(r.safety)
-	r.safetyMu.Unlock()
-	message := fmt.Sprintf("账号恢复验证未成功，继续暂停 %s: %v", wait, probeErr)
-	if err != nil {
-		message += fmt.Sprintf("；保存保护状态失败: %v", err)
-	}
-	r.emit(Event{Kind: "account_request_paused", Category: "account", Domain: "account.request", Action: "blocked",
-		Label: "账号请求保护", Message: message, Level: "warn"})
 }

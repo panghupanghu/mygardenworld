@@ -5,6 +5,18 @@ import { PolicySchema } from "@/gen/mygardenworld/v1/policy_pb";
 import { UnionViewSchema } from "@/lib/api/workspace-models";
 import PolicyPanel from "./policy-panel";
 
+it("exposes independent pearl collection and interval while offline", () => {
+  const policy = create(PolicySchema, {basic:{pearl:{autoHireEnabled:true,collectEnabled:false,collectIntervalSeconds:600}}});
+  const html = renderToStaticMarkup(<PolicyPanel policy={policy} section="basic"
+    basicView={null} garden={null} orders={null} warehouse={null} unionView={null}
+    capabilities={[]} loading={false} saving={false} message="" onPolicyChange={vi.fn()} onSave={vi.fn()} />);
+  expect(html).toContain("自动收取珍珠产出");
+  expect(html).toContain("产出收取间隔（秒）");
+  expect(html).toContain('value="600"');
+  expect(html).toContain("默认关闭，与雇佣、免费领取、开珍珠独立");
+  expect(html).toContain("间隔内不影响种植和订单");
+});
+
 it("shows independent recovery opt-in and displacement warning while offline", () => {
   const html = renderToStaticMarkup(<PolicyPanel policy={create(PolicySchema)} section="basic"
     basicView={null} garden={null} orders={null} warehouse={null} unionView={null}
@@ -15,6 +27,8 @@ it("shows independent recovery opt-in and displacement warning while offline", (
   expect(html).toContain("与自动挤号设置独立");
   expect(html).toContain("不先重试旧会话");
   expect(html).toContain("暂停/启动不会重置冷却和额度");
+  expect(html).toContain("关闭时仍可手动登录");
+  expect(html).toContain("不反复延长冷却");
 });
 
 describe("race upgrade configuration explains spending permission", () => {

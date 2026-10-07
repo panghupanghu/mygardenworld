@@ -376,7 +376,7 @@ export default function PolicyPanel({
                   label="5000 异常后允许重新登录"
                   checked={basic?.serverErrorFreshLoginEnabled ?? false}
                   onChange={(checked) => updateBasic({ serverErrorFreshLoginEnabled: checked })}
-            description="默认关闭。开启后，5000 首次保护冷却结束且额度可用时，直接重新认证，不先重试旧会话，可能挤下手机端。每次异常最多一次，两次尝试至少间隔 30 分钟；暂停时不尝试，暂停/启动不会重置冷却和额度。与自动挤号设置独立，业务核验通过后才恢复操作。"
+                  description="默认关闭，仅控制后台自动重登。开启后，5000 首次保护冷却结束且额度可用时，直接重新认证，不先重试旧会话，可能挤下手机端。每次异常自动认证最多一次，两次尝试至少间隔 30 分钟；暂停时不尝试，暂停/启动不会重置冷却和额度。关闭时仍可手动登录，单次授权不会打开此开关，仍遵守冷却和认证间隔。缓存失效且未授权时明确等待，不反复延长冷却。与自动挤号设置独立，业务核验通过后才恢复操作。"
                 />
               </div>
             </PolicyGroup>
@@ -406,6 +406,9 @@ export default function PolicyPanel({
 
             <PolicyGroup title="珍珠" icon={<Gem />}>
               <div className="grid gap-2">
+                <ToggleRow label="自动收取珍珠产出" checked={pearl?.collectEnabled ?? false} onChange={(checked) => updatePearl({ collectEnabled: checked })} />
+                <NumberRow label="产出收取间隔（秒）" value={pearl?.collectIntervalSeconds || 300} min={60} max={3600} onChange={(value) => updatePearl({ collectIntervalSeconds: value })} />
+                <p className="text-xs text-muted-foreground">默认关闭，与雇佣、免费领取、开珍珠独立；开启后仅在有产出时收取，默认间隔 300 秒（5 分钟）。间隔内不影响种植和订单，不代表游戏安全频率。</p>
                 <ToggleRow label="免费珍珠" checked={pearl?.freeEnabled ?? false} onChange={(checked) => updatePearl({ freeEnabled: checked })} />
                 <ToggleRow label="安全雇佣劳工" checked={pearl?.autoHireEnabled ?? false} onChange={(checked) => updatePearl({ autoHireEnabled: checked })} />
                 <NumberRow label="雇佣等级上限（0=不限）" value={pearl?.maxHireLevel || 0} min={0} onChange={(value) => updatePearl({ maxHireLevel: value })} />
