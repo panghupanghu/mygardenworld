@@ -170,7 +170,7 @@ func TestManagerDoesNotRegisterUncommittedStartup(t *testing.T) {
 	if _, err := m.db.ExecContext(t.Context(), `CREATE TRIGGER reject_policy BEFORE UPDATE ON account_policies BEGIN SELECT RAISE(ABORT, 'fixture write failed'); END`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.StartAutomation(t.Context(), r.account.ID, StartSourceControlPanel, true); err == nil {
+	if _, err := m.StartAutomation(t.Context(), r.account.ID, StartSourceAutomationEnable, true); err == nil {
 		t.Fatal("failed activation registered a recovery worker")
 	}
 	if m.Get(r.account.ID) != nil {
@@ -180,7 +180,7 @@ func TestManagerDoesNotRegisterUncommittedStartup(t *testing.T) {
 	if _, err := m.db.ExecContext(t.Context(), `DROP TRIGGER reject_policy`); err != nil {
 		t.Fatal(err)
 	}
-	started, err := m.StartAutomation(t.Context(), r.account.ID, StartSourceControlPanel, true)
+	started, err := m.StartAutomation(t.Context(), r.account.ID, StartSourceAutomationEnable, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestProtectedRestartCommitsActivationBeforeSelectingRecovery(t *testing.T) 
 				if err := m.db.SaveAccountRestriction(t.Context(), fixture.account.ID, safety); err != nil {
 					t.Fatal(err)
 				}
-				started, err := m.StartAutomation(t.Context(), fixture.account.ID, StartSourceControlPanel, true)
+				started, err := m.StartAutomation(t.Context(), fixture.account.ID, StartSourceAutomationEnable, true)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -226,7 +226,7 @@ func TestProtectedRestartCommitsActivationBeforeSelectingRecovery(t *testing.T) 
 				started.mu.RLock()
 				connected := started.client != nil
 				started.mu.RUnlock()
-				if connected || started.freshRecoveryEligible(time.Now()) != elapsed {
+				if connected || !started.prefersFreshRecovery() {
 					t.Fatal("protected start used a connection or selected recovery before activation")
 				}
 				stored, err := m.db.LoadAccountRequestSafety(t.Context(), fixture.account.ID)

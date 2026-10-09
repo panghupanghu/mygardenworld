@@ -9,19 +9,91 @@ import (
 	"time"
 )
 
-func TestManualRecoveryReservationPreservesServerDeadlineAndSharedSpacing(t *testing.T) {
+// Recreate the pre-v19 columns for migration fixtures, not runtime compatibility.
+func restoreV18RecoverySchema(t *testing.T, db *DB) {
+	t.Helper()
+	if _, err := db.ExecContext(t.Context(), `ALTER TABLE account_request_safety ADD COLUMN fresh_login_attempted INTEGER NOT NULL DEFAULT 0 CHECK(fresh_login_attempted IN (0,1));
+UPDATE account_request_safety SET fresh_login_attempted = (fresh_login_attempts > 0);
+ALTER TABLE account_request_safety DROP COLUMN fresh_login_attempts;`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestV19RecoveryMigrationPreservesConsumedAttempt(t *testing.T) {
+	for _, count := range []int{0, 1} {
+		db, _, account, _, _ := notificationFixture(t)
+		before := AccountRequestSafety{RestrictionCode: 97778, RestrictionAttempts: 2, RestrictedUntilMS: 2345, FreshLoginAttempts: count, LastFreshLoginMS: 1234}
+		if err := db.SaveAccountRestriction(t.Context(), account.ID, before); err != nil {
+			t.Fatal(err)
+		}
+		restoreV18RecoverySchema(t, db)
+		if _, err := db.ExecContext(t.Context(), `PRAGMA user_version=18`); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			if err := applyMigrations(t.Context(), db.writer); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got, err := db.LoadAccountRequestSafety(t.Context(), account.ID); err != nil || got != before {
+			t.Fatal("migration lost durable protection", got, err)
+		}
+	}
+}
+
+func TestFreshRecoveryReservesConfiguredBudgetAtomically(t *testing.T) {
+	for _, code := range []int{5000, 97777, 97778} {
+		db, _, account, _, _ := notificationFixture(t)
+		ctx := t.Context()
+		const now, interval = int64(1000000), int64(10000)
+		s := AccountRequestSafety{RestrictionCode: code, RestrictionAttempts: 1, RestrictedUntilMS: now}
+		if err := db.SaveAccountRestriction(ctx, account.ID, s); err != nil {
+			t.Fatal(err)
+		}
+		for attempt := range 4 {
+			var admitted atomic.Int32
+			var wg sync.WaitGroup
+			for range 12 {
+				wg.Go(func() {
+					ok, err := db.ReserveFreshRecovery(ctx, account.ID, now+int64(attempt)*interval, interval, 3)
+					if err != nil {
+						t.Error(err)
+					}
+					if ok {
+						admitted.Add(1)
+					}
+				})
+			}
+			wg.Wait()
+			want := int32(1)
+			if attempt == 3 {
+				want = 0
+			}
+			if admitted.Load() != want {
+				t.Fatalf("code=%d attempt=%d admitted=%d", code, attempt, admitted.Load())
+			}
+		}
+		got, err := db.LoadAccountRequestSafety(ctx, account.ID)
+		if err != nil || got.FreshLoginAttempts != 3 {
+			t.Fatal(got, err)
+		}
+		if ok, err := db.ReserveFreshRecovery(ctx, account.ID, now+4*interval, interval, 4); err != nil || !ok {
+			t.Fatal("raising limit did not allow next attempt", ok, err)
+		}
+		if ok, err := db.ReserveFreshRecovery(ctx, account.ID, now+5*interval, interval, 2); err != nil || ok {
+			t.Fatal("lowering limit reset budget", ok, err)
+		}
+	}
+}
+
+func TestManualRecoveryRecordsAttemptsWithoutAutomaticAdmissionLimits(t *testing.T) {
 	for _, code := range []int{5000, 97777, 97778} {
 		db, _, account, _, _ := notificationFixture(t)
 		now := time.Now().UnixMilli()
-		interval := (30 * time.Minute).Milliseconds()
-		s := AccountRequestSafety{RestrictionCode: code, RestrictionAttempts: 3, RestrictedUntilMS: now + 1, FreshLoginAttempted: true, LastFreshLoginMS: now - interval, LastRaceDeleteMS: 1234}
-		if err := db.SaveAccountRestriction(t.Context(), account.ID, s); err != nil {
-			t.Fatal(err)
+		s := AccountRequestSafety{RestrictionCode: code, RestrictionAttempts: 3, RestrictedUntilMS: now + 3600000, FreshLoginAttempts: 3, LastFreshLoginMS: now, LastRaceDeleteMS: 1234}
+		if ok, err := db.ReserveRaceDelete(t.Context(), account.ID, s.LastRaceDeleteMS, 1); err != nil || !ok {
+			t.Fatal(ok, err)
 		}
-		if ok, err := db.ReserveManualRecovery(t.Context(), account.ID, now, interval); err != nil || ok {
-			t.Fatal("manual login bypassed server cooldown", ok, err)
-		}
-		s.RestrictedUntilMS = now
 		if err := db.SaveAccountRestriction(t.Context(), account.ID, s); err != nil {
 			t.Fatal(err)
 		}
@@ -29,7 +101,7 @@ func TestManualRecoveryReservationPreservesServerDeadlineAndSharedSpacing(t *tes
 		var wg sync.WaitGroup
 		for range 12 {
 			wg.Go(func() {
-				ok, err := db.ReserveManualRecovery(t.Context(), account.ID, now, interval)
+				ok, err := db.ReserveManualRecovery(t.Context(), account.ID, now)
 				if err != nil {
 					t.Error(err)
 				}
@@ -39,17 +111,12 @@ func TestManualRecoveryReservationPreservesServerDeadlineAndSharedSpacing(t *tes
 			})
 		}
 		wg.Wait()
-		if admitted.Load() != 1 {
+		if admitted.Load() != 12 {
 			t.Fatalf("manual admission count=%d", admitted.Load())
 		}
-		if ok, err := db.ReserveManualRecovery(t.Context(), account.ID, now+interval-1, interval); err != nil || ok {
-			t.Fatal("manual login bypassed shared spacing", ok, err)
-		}
-		if ok, err := db.ReserveManualRecovery(t.Context(), account.ID, now+interval, interval); err != nil || !ok {
-			t.Fatal("new explicit login blocked by old automatic allowance", ok, err)
-		}
 		stored, err := db.LoadAccountRequestSafety(t.Context(), account.ID)
-		if err != nil || stored.RestrictionCode != code || stored.RestrictedUntilMS != now || stored.RestrictionAttempts != 3 {
+		s.FreshLoginAttempts += 12
+		if err != nil || stored != s {
 			t.Fatal("reservation cleared server protection", stored, err)
 		}
 	}
@@ -59,7 +126,7 @@ func TestRequestSafetyV14MigrationAndDurableFreshReservation(t *testing.T) {
 	db, _, account, _, _ := notificationFixture(t)
 	removeAccountDeletionSchema(t, db.writer)
 	ctx := t.Context()
-	if _, err := db.ExecContext(ctx, `ALTER TABLE account_request_safety DROP COLUMN fresh_login_attempted;
+	if _, err := db.ExecContext(ctx, `ALTER TABLE account_request_safety DROP COLUMN fresh_login_attempts;
 ALTER TABLE account_request_safety DROP COLUMN last_fresh_login_ms;
 INSERT INTO account_request_safety VALUES (?,1234,5678,5000,2); PRAGMA user_version=13;`, account.ID); err != nil {
 		t.Fatal(err)
@@ -68,7 +135,7 @@ INSERT INTO account_request_safety VALUES (?,1234,5678,5000,2); PRAGMA user_vers
 		t.Fatal(err)
 	}
 	s, err := db.LoadAccountRequestSafety(ctx, account.ID)
-	if err != nil || s.LastRaceDeleteMS != 1234 || s.RestrictionCode != 5000 || s.FreshLoginAttempted || s.LastFreshLoginMS != 0 {
+	if err != nil || s.LastRaceDeleteMS != 1234 || s.RestrictionCode != 5000 || s.FreshLoginAttempts != 0 || s.LastFreshLoginMS != 0 {
 		t.Fatal(s, err)
 	}
 	nowMS := time.Now().UnixMilli()
@@ -76,7 +143,7 @@ INSERT INTO account_request_safety VALUES (?,1234,5678,5000,2); PRAGMA user_vers
 	var wg sync.WaitGroup
 	for range 12 {
 		wg.Go(func() {
-			ok, err := db.ReserveFreshRecovery(ctx, account.ID, nowMS, time.Hour.Milliseconds())
+			ok, err := db.ReserveFreshRecovery(ctx, account.ID, nowMS, time.Hour.Milliseconds(), 3)
 			if err != nil {
 				t.Error(err)
 			}
@@ -90,14 +157,14 @@ INSERT INTO account_request_safety VALUES (?,1234,5678,5000,2); PRAGMA user_vers
 		t.Fatalf("%d simultaneous attempts admitted", allowed.Load())
 	}
 	s, err = db.LoadAccountRequestSafety(ctx, account.ID)
-	if err != nil || !s.FreshLoginAttempted || s.LastFreshLoginMS != nowMS || s.LastRaceDeleteMS != 1234 {
+	if err != nil || s.FreshLoginAttempts != 1 || s.LastFreshLoginMS != nowMS || s.LastRaceDeleteMS != 1234 {
 		t.Fatal(s, err)
 	}
-	s.FreshLoginAttempted = false
+	s.FreshLoginAttempts = 0
 	if err := db.SaveAccountRestriction(ctx, account.ID, s); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := db.ReserveFreshRecovery(ctx, account.ID, nowMS+1, time.Hour.Milliseconds()); ok || err != nil {
+	if ok, err := db.ReserveFreshRecovery(ctx, account.ID, nowMS+1, time.Hour.Milliseconds(), 3); ok || err != nil {
 		t.Fatal(ok, err)
 	}
 }

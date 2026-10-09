@@ -4,7 +4,7 @@ Personal local automation prototype. One `gardend` daemon owns game sessions, au
 
 ## Toolchain
 
-- Use system Go 1.27.0 for every Go build, test, lint, generation, and release command.
+- Use system Go 1.27.2 for every Go build, test, lint, generation, and release command.
 - The Web UI uses Node.js 22, pnpm 10, Next.js 16.3, React 19, and Tailwind CSS 4.
 - Generated files under `gen/` and `web/src/gen/` must not be edited by hand.
 
@@ -12,7 +12,7 @@ Personal local automation prototype. One `gardend` daemon owns game sessions, au
 make build            # bin/gardend
 make test             # go test -count=1 ./...
 make test-race        # go test -race -count=1 ./...
-make lint             # golangci-lint v2.13.0
+make lint             # golangci-lint v2.14.0
 make proto-gen        # Go protobuf/connect code
 make proto-gen-web    # TypeScript protobuf code
 make frontend:test
@@ -75,7 +75,7 @@ web/             embedded Next.js control panel
 
 - This prototype does not carry runtime backward compatibility. Do not add deprecated fields, Protobuf `reserved` declarations, legacy decoders, old policy aliases, or parallel API versions unless explicitly requested.
 - Breaking schema work stays in `mygardenworld.v1`. Regenerate both Go and TypeScript outputs and update all callers atomically.
-- SQLite uses transactional, ordered `PRAGMA user_version` migrations and currently targets schema v18. A database schema change requires a one-way migration and tests; unversioned legacy databases remain rejected.
+- SQLite uses transactional, ordered `PRAGMA user_version` migrations and currently targets schema v19. A database schema change requires a one-way migration and tests; unversioned legacy databases remain rejected.
 - Account deletion is durable intent followed by drained, bounded background cleanup. Pending accounts cannot start or accept mutations; do not reintroduce request-bound history cascades.
 - SQLite writes use one writer connection; reads use a bounded read-only pool. Route mutations with `RETURNING` explicitly to the writer. Inside transactions use only the transaction handle; do not re-enter store methods or call external services while holding a connection or transaction.
 - Policy is one strict protojson document in `account_policies.policy_json`. Public replace/import/export/copy operations handle the whole current policy.
